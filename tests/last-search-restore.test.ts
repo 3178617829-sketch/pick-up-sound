@@ -1,0 +1,123 @@
+import { createApplicationStore } from "../ui/store/app-state.ts";
+import { normalizeTrack } from "../ui/shared/track-utils.ts";
+import { sourceSlice } from "./helpers/source-slice.ts";
+import assert from "node:assert/strict";
+import { readFileSync } from "./helpers/module-syntax.ts";
+import path from "node:path";
+import { test } from "node:test";
+import vm from "node:vm";
+
+const source = readFileSync(path.join(import.meta.dirname, "../ui/app/main.ts"), "utf8");
+const searchSource = readFileSync(path.join(import.meta.dirname, "../ui/features/search/search.ts"), "utf8");
+const stateSource = readFileSync(path.join(import.meta.dirname, "../ui/shared/controller-runtime.ts"), "utf8");
+const storageSource = readFileSync(path.join(import.meta.dirname, "../ui/shared/storage.ts"), "utf8");
+
+// 切片：关键词持久化助手 + 恢复搜索状态与提示（注入应用 store 动作）。
+// key 常量已收敛到 storage.ts，VM 里要的常量从那边取（export const 只剥前缀，声明仍可用）。
+const helpers = sourceSlice(storageSource, "ui/shared/storage.ts", null, null) + "\n"
+  + sourceSlice(searchSource, "ui/features/search/search.ts", "function readLastSearchKeyword(", "function getSearchActions(");
+assert.ok(helpers.includes("function saveLastSearchKeyword"));
+
+function setup({ keyword = "", results = [] }: { keyword?: string; results?: { bvid: string }[] } = {}) {
+  const storage = new Map();
+  if (keyword) {
+    storage.set("bilibili-music.last-search", keyword);
+  }
+  const context = vm.createContext({
+    localStorage: {
+      getItem: (key: string) => (storage.has(key) ? storage.get(key) : null),
+      setItem: (key: string, value: unknown) => storage.set(key, String(value)),
+    },
+    searchKeyword: { value: keyword },
+    searchButton: { disabled: false },
+    searchStatus: { textContent: "" },
+    result: { hidden: true },
+    searchState: {
+      results,
+      userKeyword: "",
+      requestKeyword: "",
+      tids: 3,
+      order: null,
+      rerank: true,
+      sortMode: "all",
+      page: 0,
+      isLoadingMore: false,
+      hasMore: false,
+      requestVersion: 0,
+    },
+    invoke: async () => {
+      throw new Error("unexpected invoke");
+    },
+    console: { warn() {} },
+  });
+  vm.runInContext(helpers + "\nglobalThis.__api = { readLastSearchKeyword, saveLastSearchKeyword };", context);
+  const store = createApplicationStore({
+    invoke: ((command: string, payload: unknown) => context.invoke(command, payload)) as Parameters<typeof createApplicationStore>[0]["invoke"],
+    setTimeout: () => 0, clearTimeout() {}, report() {},
+  });
+  store.subscribe(state => {
+    context.searchState = state.search;
+    context.searchButton.disabled = state.search.view.buttonDisabled ?? false;
+    context.searchStatus.textContent = state.search.view.status ?? "";
+    if (state.search.view.resultVisible !== null) context.result.hidden = !state.search.view.resultVisible;
+  });
+  if (results.length) store.actions.search.appendResults(results.map(normalizeTrack));
+  context.__api.runSearch = (options: { userKeyword?: string; restored?: boolean } = {}) => store.actions.search.runSearch({
+    ...options, userKeyword: options.userKeyword ?? context.searchKeyword.value, saveKeyword: context.__api.saveLastSearchKeyword,
+  });
+  return { context, storage };
+}
+
+test("restored search announces the reused keyword while loading and after success", async () => {
+  const { context, storage } = setup({ keyword: "周杰伦" });
+  let calls = 0;
+  context.__api.runSearch;
+  const ctx = context;
+  ctx.invoke = async (command: string, payload: CommandMap["search_videos"]["args"]) => {
+    calls += 1;
+    assert.equal(command, "search_videos");
+    assert.equal(payload.keyword, "周杰伦");
+    return [{ bvid: "BV0000000001" }, { bvid: "BV0000000002" }];
+  };
+  const p = ctx.__api.runSearch({ userKeyword: "周杰伦", restored: true });
+  assert.match(ctx.searchStatus.textContent, /已复用上次搜索关键词「周杰伦」，正在搜索…/);
+  await p;
+  assert.match(ctx.searchStatus.textContent, /已复用上次搜索关键词「周杰伦」刷新完成，找到 2 个普通视频/);
+  assert.equal(calls, 1);
+  assert.equal(storage.get("bilibili-music.last-search"), "周杰伦");
+});
+
+test("restored search failure keeps the reuse notice in the error message", async () => {
+  const { context } = setup();
+  context.invoke = async () => Promise.reject("网络中断");
+  await context.__api.runSearch({ userKeyword: "洛天依", restored: true });
+  assert.match(context.searchStatus.textContent, /复用上次搜索关键词「洛天依」搜索失败：网络中断/);
+});
+
+test("successful keyword search persists the keyword; empty tab search does not", async () => {
+  const { context, storage } = setup();
+  context.invoke = async () => [{ bvid: "BV0000000001" }];
+  await context.__api.runSearch({ userKeyword: "林俊杰" });
+  assert.equal(storage.get("bilibili-music.last-search"), "林俊杰");
+
+  // 无关键词的分区热门不覆盖已存关键词。
+  context.invoke = async () => [{ bvid: "BV0000000002" }];
+  await context.__api.runSearch({ userKeyword: "" });
+  assert.equal(storage.get("bilibili-music.last-search"), "林俊杰");
+});
+
+test("failed keyword search does not persist the keyword", async () => {
+  const { context, storage } = setup();
+  context.invoke = async () => {
+    throw new Error("超时");
+  };
+  await context.__api.runSearch({ userKeyword: "坏关键词" });
+  assert.ok(!storage.has("bilibili-music.last-search"));
+});
+
+test("corrupted or oversized stored keyword is clamped by readLastSearchKeyword", () => {
+  const { context } = setup({ keyword: "   ".padEnd(120, "a") });
+  const value = context.__api.readLastSearchKeyword();
+  assert.ok(value.length <= 100);
+  assert.equal(value, value.trim());
+});

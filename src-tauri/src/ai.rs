@@ -1,0 +1,1428 @@
+mod protocol;
+mod recommendation;
+
+use protocol::{
+    build_request_for_purpose, extract_content, output_truncated_reason, response_snippet,
+    RequestPurpose,
+};
+
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::library::{
+    get_play_history, get_search_history, library_root, list_favorites, list_playlists,
+    read_json_or_default, write_json_atomic as write_library_json_atomic, Versioned,
+};
+use crate::search::{SearchClient, SearchVideo};
+
+const VERSION: u32 = 1;
+const AI_CONFIG_FILE: &str = "ai-config.json";
+const RECOMMENDATIONS_FILE: &str = "recommendations.json";
+const RECOMMENDATIONS_VERSION: u32 = 1;
+#[cfg(not(debug_assertions))]
+const DATA_SUBDIR: &str = "data";
+const AI_TIMEOUT_SHORT_SECS: u64 = 15;
+const AI_RECOMMENDATION_TIMEOUT_SECS: u64 = 20;
+const AI_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// 用户可选的 AI 接口规范。存储值用完整规范名（kebab-case），
+/// 后续 OpenAI / Anthropic 推出新规范时新增枚举值即可。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+enum ApiFormat {
+    #[default]
+    #[serde(rename = "openai-chat-completions")]
+    OpenAiChatCompletions,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+}
+
+impl ApiFormat {
+    fn parse(value: &str) -> Result<ApiFormat, String> {
+        match value.trim() {
+            "openai-chat-completions" => Ok(ApiFormat::OpenAiChatCompletions),
+            "openai-responses" => Ok(ApiFormat::OpenAiResponses),
+            "anthropic-messages" => Ok(ApiFormat::AnthropicMessages),
+            other => Err(format!(
+                "不支持的 AI 接口规范：{other}。支持 openai-chat-completions / openai-responses / anthropic-messages。"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ApiFormat::OpenAiChatCompletions => "openai-chat-completions",
+            ApiFormat::OpenAiResponses => "openai-responses",
+            ApiFormat::AnthropicMessages => "anthropic-messages",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AiConfig {
+    version: u32,
+    #[serde(default)]
+    api_format: ApiFormat,
+    base_url: String,
+    model: String,
+    api_key: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConfigView {
+    pub api_format: String,
+    pub base_url: String,
+    pub model: String,
+    pub has_key: bool,
+    pub key_hint: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConnectionTestResult {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ChatMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchIntent {
+    #[serde(default)]
+    keyword: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecommendationsFile {
+    version: u32,
+    items: Vec<SearchVideo>,
+    generated_at: i64,
+}
+
+#[derive(Deserialize)]
+struct StoredRecommendationsFile {
+    version: u32,
+    items: Vec<StoredSearchVideo>,
+    generated_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSearchVideo {
+    bvid: String,
+    title: String,
+    uploader: String,
+    thumbnail_url: String,
+    duration_seconds: u64,
+    play_count: Option<u64>,
+    pubdate: Option<u64>,
+}
+
+impl Default for RecommendationsFile {
+    fn default() -> Self {
+        Self {
+            version: RECOMMENDATIONS_VERSION,
+            items: Vec::new(),
+            generated_at: 0,
+        }
+    }
+}
+
+impl Versioned for RecommendationsFile {
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+impl<'de> Deserialize<'de> for RecommendationsFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let stored = StoredRecommendationsFile::deserialize(deserializer)?;
+        Ok(Self {
+            version: stored.version,
+            items: stored
+                .items
+                .into_iter()
+                .map(|video| SearchVideo {
+                    bvid: video.bvid,
+                    title: video.title,
+                    uploader: video.uploader,
+                    thumbnail_url: video.thumbnail_url,
+                    duration_seconds: video.duration_seconds,
+                    play_count: video.play_count,
+                    pubdate: video.pubdate,
+                })
+                .collect(),
+            generated_at: stored.generated_at,
+        })
+    }
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            api_format: ApiFormat::default(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+        }
+    }
+}
+
+impl AiConfig {
+    fn view(&self) -> AiConfigView {
+        AiConfigView {
+            api_format: self.api_format.as_str().to_owned(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            has_key: !self.api_key.is_empty(),
+            key_hint: key_hint(&self.api_key),
+        }
+    }
+
+    fn ensure_supported_version(&self, path: &Path) -> Result<(), String> {
+        if self.version == VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} 的 AI 配置版本 {} 暂不支持。",
+                path.display(),
+                self.version
+            ))
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_ai_config() -> Result<AiConfigView, String> {
+    let storage_guard = crate::storage::lock_storage()?;
+    let guard = &storage_guard;
+    Ok(read_ai_config(guard)?.view())
+}
+
+#[tauri::command]
+pub fn get_saved_recommendations() -> Result<Vec<SearchVideo>, String> {
+    let storage_guard = crate::storage::lock_storage()?;
+    let guard = &storage_guard;
+    let path = library_root()?.join(RECOMMENDATIONS_FILE);
+    Ok(read_saved_recommendations_from_path(guard, &path))
+}
+
+pub(crate) fn save_recommendations(items: &[SearchVideo]) -> Result<(), String> {
+    let storage_guard = crate::storage::lock_storage()?;
+    let guard = &storage_guard;
+    let path = library_root()?.join(RECOMMENDATIONS_FILE);
+    write_recommendations_to_path(guard, &path, items)
+}
+
+#[tauri::command]
+pub fn set_ai_config(
+    api_format: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+) -> Result<AiConfigView, String> {
+    let storage_guard = crate::storage::lock_storage()?;
+    let guard = &storage_guard;
+    let api_format = ApiFormat::parse(&api_format)?;
+    let base_url = normalize_required("base_url", &base_url)?;
+    let model = normalize_required("model", &model)?;
+    let mut config = read_ai_config(guard)?;
+    config.api_format = api_format;
+    config.base_url = base_url;
+    config.model = model;
+    let api_key = api_key.trim();
+    if !api_key.is_empty() {
+        config.api_key = api_key.to_owned();
+    }
+    write_ai_config(guard, &ai_config_path(guard)?, &config)?;
+    Ok(config.view())
+}
+
+#[tauri::command]
+pub async fn test_ai_connection(
+    api_format: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<AiConnectionTestResult, String> {
+    let stored = read_ai_config(&crate::storage::lock_storage()?)?;
+    let api_format = match api_format
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => ApiFormat::parse(value)?,
+        None => stored.api_format,
+    };
+    let api_key = api_key.unwrap_or_default().trim().to_owned();
+    let api_key = if api_key.is_empty() {
+        if stored.api_key.is_empty() {
+            return Ok(AiConnectionTestResult {
+                ok: false,
+                message: "请先填写 API key。".to_owned(),
+            });
+        }
+        stored.api_key.clone()
+    } else {
+        api_key
+    };
+    let base_url = non_empty_or_stored(base_url, &stored.base_url);
+    let model = non_empty_or_stored(model, &stored.model);
+
+    if base_url.is_empty() || model.is_empty() {
+        return Ok(AiConnectionTestResult {
+            ok: false,
+            message: "AI 配置不完整。".to_owned(),
+        });
+    }
+
+    let config = AiConfig {
+        version: VERSION,
+        api_format,
+        base_url,
+        model,
+        api_key,
+    };
+    let messages = vec![ChatMessage {
+        role: "user",
+        content: "ping".to_owned(),
+    }];
+
+    match chat_completion_with_config(&config, messages, 512, AI_TIMEOUT_SHORT_SECS).await {
+        Ok(_) => Ok(AiConnectionTestResult {
+            ok: true,
+            message: "连接成功。".to_owned(),
+        }),
+        Err(error) => Ok(AiConnectionTestResult {
+            ok: false,
+            message: error,
+        }),
+    }
+}
+
+pub async fn generate_recommendations(
+    search: &SearchClient,
+    user_hint: Option<String>,
+) -> Result<Vec<SearchVideo>, String> {
+    recommendation::generate(search, user_hint).await
+}
+
+fn read_ai_config(guard: &crate::storage::StorageGuard) -> Result<AiConfig, String> {
+    read_ai_config_from_path(guard, &ai_config_path(guard)?)
+}
+
+async fn chat_completion_with_config(
+    config: &AiConfig,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    chat_completion_with_purpose(
+        config,
+        messages,
+        max_tokens,
+        timeout_secs,
+        RequestPurpose::Default,
+    )
+    .await
+}
+
+/// 发一次 chat completion，按所选 API 规范把响应解析成纯文本。
+///
+/// 三种规范（OpenAI / 智谱 / Anthropic 兼容网关）的 endpoint、额外请求头、响应结构都不同，
+/// 由 `build_request_for_purpose` 和 `extract_content` 按 `purpose` 分派——这个函数本身只管
+/// 「组装 → 发 → 错误分流 → 取值」。
+///
+/// 120 多行的真正原因：**两条错误策略在每个失败点都要分叉一次**。
+/// - `Recommendation`：错误信息必须短（UI 直接展示给用户），服务端原始响应不能泄露；
+/// - 聊天：错误要详细（`eprintln!` 打端点 / model / 原始响应片段），否则网关路由错、
+///   模型名错、参数错根本没法定位。
+///
+/// 这个分叉在「HTTP 非 2xx」「响应不是 JSON」「响应里没有 content」三处各出现一次，
+/// 加起来就是这堆 if。改这里时三处要一起看，漏一处就会出现「推荐界面弹一串英文原始报错」
+/// 或者「聊天失败只说稍后重试、日志里什么也没有」。
+///
+/// 另外两个已知坑写在下面对应位置：统一带 `Bearer`（智谱兼容网关只认这个，官方 Anthropic
+/// 忽略它但不报错）、推理模型（deepseek-reasoner 等）思考过程吃满 `max_tokens` 时
+/// `content` 为空而截断原因在 `output_truncated_reason`。
+async fn chat_completion_with_purpose(
+    config: &AiConfig,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+    timeout_secs: u64,
+    purpose: RequestPurpose,
+) -> Result<String, String> {
+    if config.base_url.trim().is_empty()
+        || config.model.trim().is_empty()
+        || config.api_key.is_empty()
+    {
+        return Err("AI 配置不完整。".to_owned());
+    }
+
+    let built = build_request_for_purpose(config, &messages, max_tokens, purpose);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(AI_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|error| {
+            format!(
+                "无法创建 AI 客户端：{}",
+                safe_error(&error.to_string(), &config.api_key)
+            )
+        })?;
+    let mut request = client
+        .post(&built.endpoint)
+        .header(CONTENT_TYPE, "application/json")
+        // 三种规范统一带 Bearer：OpenAI 系标准用法；
+        // 智谱等 Anthropic 兼容网关也认 Bearer（不认 x-api-key），官方 Anthropic 则忽略它。
+        .header(AUTHORIZATION, format!("Bearer {}", config.api_key));
+    for (name, value) in &built.headers {
+        request = request.header(*name, value);
+    }
+    let response = request.json(&built.body).send().await.map_err(|error| {
+        ai_request_error(
+            error.is_timeout(),
+            &error.to_string(),
+            "AI 请求失败：",
+            &config.api_key,
+        )
+    })?;
+
+    let status = response.status();
+    let body_text = response.text().await.map_err(|error| {
+        ai_request_error(
+            error.is_timeout(),
+            &error.to_string(),
+            "响应读取失败：",
+            &config.api_key,
+        )
+    })?;
+    if !status.is_success() {
+        if purpose == RequestPurpose::Recommendation {
+            return Err(format!(
+                "HTTP {}：推荐模型请求失败，请稍后重试。",
+                status.as_u16()
+            ));
+        }
+        // 把服务端返回的真实错误体和请求端点打到终端，否则无法定位网关路径/参数问题。
+        let snippet = safe_error(&response_snippet(&body_text), &config.api_key);
+        eprintln!(
+            "[ai] {} 请求 {} 返回 HTTP {}：{}",
+            config.api_format.as_str(),
+            built.endpoint,
+            status.as_u16(),
+            snippet
+        );
+        return Err(format!("HTTP {}：{}", status.as_u16(), snippet));
+    }
+    let body: serde_json::Value = serde_json::from_str(&body_text).map_err(|error| {
+        if purpose == RequestPurpose::Recommendation {
+            return "模型未返回有效的推荐 JSON，请稍后重试。".to_owned();
+        }
+        let snippet = response_snippet(&body_text);
+        eprintln!(
+            "[ai] {} 响应不是有效 JSON：{}",
+            config.api_format.as_str(),
+            safe_error(&snippet, &config.api_key)
+        );
+        ai_request_error(
+            false,
+            &error.to_string(),
+            "响应不是有效的 JSON：",
+            &config.api_key,
+        )
+    })?;
+    if purpose == RequestPurpose::Recommendation
+        && output_truncated_reason(config.api_format, &body).is_some()
+    {
+        return Err("模型推荐输出被截断，请稍后重试或更换模型。".to_owned());
+    }
+    match extract_content(config.api_format, &body) {
+        Some(content) => Ok(content),
+        None => {
+            if purpose == RequestPurpose::Recommendation {
+                return Err("模型未返回有效的推荐内容，请稍后重试。".to_owned());
+            }
+            // 按所选规范没提取到文本时，打印端点、模型和原始响应体，定位网关路由/模型/参数问题。
+            let snippet = safe_error(&response_snippet(&body_text), &config.api_key);
+            eprintln!(
+                "[ai] {} 请求 {}（model={}）响应缺少 content，原始响应：{}",
+                config.api_format.as_str(),
+                built.endpoint,
+                config.model,
+                snippet
+            );
+            if let Some(reason) = output_truncated_reason(config.api_format, &body) {
+                return Err(safe_error(
+                    &format!("模型输出被 max tokens 截断（{reason}），推理模型思考占用了全部输出额度；请换非推理模型或重试。"),
+                    &config.api_key,
+                ));
+            }
+            Err(format!(
+                "响应缺少 content（model={}，原始响应片段：{}）",
+                config.model, snippet
+            ))
+        }
+    }
+}
+
+fn build_taste_profile() -> String {
+    let mut lines = Vec::new();
+    let mut history = get_search_history().unwrap_or_default();
+    history.sort_by(|left, right| right.count.cmp(&left.count));
+    let history: Vec<String> = history
+        .into_iter()
+        .take(8)
+        .map(|item| format!("{} x{}", item.keyword, item.count))
+        .collect();
+    if !history.is_empty() {
+        lines.push(format!("搜索偏好: {}", history.join(", ")));
+    }
+
+    let favorites: Vec<String> = list_favorites()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.video().cloned())
+        .take(12)
+        .map(|track| format!("{} - {}", track.title, track.uploader))
+        .collect();
+    if !favorites.is_empty() {
+        lines.push(format!("收藏歌曲: {}", favorites.join(" | ")));
+    }
+
+    let mut seen_playlist_bvids = HashSet::new();
+    let playlist_tracks: Vec<String> = list_playlists()
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|playlist| playlist.items)
+        .filter_map(|entry| entry.video().cloned())
+        .filter(|track| seen_playlist_bvids.insert(track.bvid.to_lowercase()))
+        .take(12)
+        .map(|track| format!("{} - {}", track.title, track.uploader))
+        .collect();
+    if !playlist_tracks.is_empty() {
+        lines.push(format!("歌单收藏: {}", playlist_tracks.join(" | ")));
+    }
+
+    let mut play_history = get_play_history().unwrap_or_default();
+    play_history.sort_by(|left, right| right.count.cmp(&left.count));
+    let play_history: Vec<String> = play_history
+        .into_iter()
+        .take(10)
+        .map(|track| format!("{} - {} x{}", track.title, track.uploader, track.count))
+        .collect();
+    if !play_history.is_empty() {
+        lines.push(format!("常听: {}", play_history.join(" | ")));
+    }
+    lines.join("\n")
+}
+
+async fn generate_search_intents(
+    config: &AiConfig,
+    profile: &str,
+) -> Result<Vec<SearchIntent>, String> {
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: "你只生成 B 站音乐搜索关键词意图。禁止输出 bvid，禁止把具体歌名当最终推荐，禁止解释。只输出 JSON 数组，最多 5 项，每项形如 {\"keyword\":\"...\",\"reason\":\"...\"}。".to_owned(),
+        },
+        ChatMessage {
+            role: "user",
+            content: format!("根据以下用户口味生成检索关键词意图，不要推荐具体视频。\n{profile}"),
+        },
+    ];
+    let content = chat_completion_with_purpose(
+        config,
+        messages,
+        2000,
+        AI_RECOMMENDATION_TIMEOUT_SECS,
+        RequestPurpose::Recommendation,
+    )
+    .await?;
+    Ok(parse_search_intents(&content).into_iter().take(5).collect())
+}
+
+async fn rerank_candidates(
+    config: &AiConfig,
+    profile: &str,
+    candidates: &[SearchVideo],
+) -> Result<Vec<String>, String> {
+    let candidate_text = candidates
+        .iter()
+        .take(30)
+        .map(|video| {
+            format!(
+                "{} | {} | {} | {}",
+                video.bvid,
+                video.title,
+                video.uploader,
+                video.play_count.unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: "你只能重排用户提供的真实候选。只输出 JSON 字符串数组，数组元素必须仅来自候选 bvid，不得新增、编造或解释。".to_owned(),
+        },
+        ChatMessage {
+            role: "user",
+            content: format!("用户口味:\n{profile}\n\n真实候选(bvid | title | uploader | playCount):\n{candidate_text}"),
+        },
+    ];
+    let content = chat_completion_with_purpose(
+        config,
+        messages,
+        2000,
+        AI_RECOMMENDATION_TIMEOUT_SECS,
+        RequestPurpose::Recommendation,
+    )
+    .await?;
+    Ok(parse_bvid_list(&content))
+}
+
+fn parse_search_intents(input: &str) -> Vec<SearchIntent> {
+    let Some(json) = extract_json_array(input) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<SearchIntent>>(&json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|intent| {
+            let keyword = intent.keyword.trim().to_owned();
+            if keyword.is_empty() || keyword.starts_with("BV") {
+                None
+            } else {
+                Some(SearchIntent {
+                    keyword,
+                    reason: intent.reason,
+                })
+            }
+        })
+        .collect()
+}
+
+fn parse_bvid_list(input: &str) -> Vec<String> {
+    let Some(json) = extract_json_array(input) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&json).unwrap_or_default()
+}
+
+fn extract_json_array(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let without_fence = if let Some(fence_start) = trimmed.find("```") {
+        let after_start = &trimmed[fence_start + 3..];
+        let after_lang = after_start
+            .find('\n')
+            .map(|index| &after_start[index + 1..])
+            .unwrap_or(after_start);
+        after_lang
+            .find("```")
+            .map(|index| &after_lang[..index])
+            .unwrap_or(after_lang)
+            .trim()
+    } else {
+        trimmed
+    };
+    let start = without_fence.find('[')?;
+    let end = without_fence.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    Some(without_fence[start..=end].to_owned())
+}
+
+fn filter_known_bvids<'a>(
+    bvids: Vec<String>,
+    known_bvids: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let known: HashSet<String> = known_bvids.map(str::to_owned).collect();
+    let mut seen = HashSet::new();
+    bvids
+        .into_iter()
+        .filter(|bvid| known.contains(bvid) && seen.insert(bvid.clone()))
+        .collect()
+}
+
+fn order_videos_by_bvids(videos: Vec<SearchVideo>, ordered_bvids: &[String]) -> Vec<SearchVideo> {
+    let mut by_bvid: HashMap<String, SearchVideo> = videos
+        .into_iter()
+        .map(|video| (video.bvid.clone(), video))
+        .collect();
+    let mut ordered = Vec::new();
+    for bvid in ordered_bvids {
+        if let Some(video) = by_bvid.remove(bvid) {
+            ordered.push(video);
+        }
+    }
+    ordered.extend(by_bvid.into_values());
+    ordered
+}
+
+fn read_ai_config_from_path(
+    guard: &crate::storage::StorageGuard,
+    path: &Path,
+) -> Result<AiConfig, String> {
+    if !path.exists() {
+        return Ok(AiConfig::default());
+    }
+    let contents = crate::storage::read_to_string(guard, path)
+        .map_err(|error| format!("无法读取 AI 配置 {}：{error}", path.display()))?;
+    let parsed: AiConfig = serde_json::from_str(&contents)
+        .map_err(|error| format!("{} 格式损坏：{error}", path.display()))?;
+    parsed.ensure_supported_version(path)?;
+    Ok(parsed)
+}
+
+fn write_ai_config(
+    guard: &crate::storage::StorageGuard,
+    path: &Path,
+    config: &AiConfig,
+) -> Result<(), String> {
+    write_json_atomic(guard, path, config)
+}
+
+fn read_saved_recommendations_from_path(
+    guard: &crate::storage::StorageGuard,
+    path: &Path,
+) -> Vec<SearchVideo> {
+    read_json_or_default::<RecommendationsFile>(guard, path)
+        .map(|file| file.items)
+        .unwrap_or_default()
+}
+
+fn write_recommendations_to_path(
+    guard: &crate::storage::StorageGuard,
+    path: &Path,
+    items: &[SearchVideo],
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct RecommendationsFileRef<'a> {
+        version: u32,
+        items: &'a [SearchVideo],
+        generated_at: i64,
+    }
+
+    write_library_json_atomic(
+        guard,
+        path,
+        &RecommendationsFileRef {
+            version: RECOMMENDATIONS_VERSION,
+            items,
+            generated_at: now_unix_seconds(),
+        },
+    )
+}
+
+fn write_json_atomic<T: Serialize>(
+    guard: &crate::storage::StorageGuard,
+    target: &Path,
+    value: &T,
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("无法确定 {} 的父目录。", target.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 AI 配置目录 {}：{error}", parent.display()))?;
+
+    let tmp = crate::library::atomic_temp_path(target);
+    let backup = crate::library::atomic_backup_path(target);
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("AI 配置序列化失败：{error}"))?;
+
+    {
+        let mut file = crate::storage::create_file(guard, &tmp)
+            .map_err(|error| format!("无法写入 {}：{error}", tmp.display()))?;
+        file.write_all(json.as_bytes())
+            .map_err(|error| format!("无法写入 {}：{error}", tmp.display()))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("无法写入 {}：{error}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("无法同步 {}：{error}", tmp.display()))?;
+    }
+
+    if target.exists() {
+        crate::storage::rename(guard, target, &backup).map_err(|error| {
+            let _ = crate::storage::remove_file(guard, &tmp);
+            format!(
+                "无法备份旧 AI 配置 {} 到 {}：{error}",
+                target.display(),
+                backup.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = crate::storage::rename(guard, &tmp, target) {
+        if backup.exists() {
+            let _ = crate::storage::rename(guard, &backup, target);
+        }
+        let _ = crate::storage::remove_file(guard, &tmp);
+        return Err(format!("无法保存 AI 配置 {}：{error}", target.display()));
+    }
+
+    if backup.exists() {
+        let _ = crate::storage::remove_file(guard, backup);
+    }
+    Ok(())
+}
+
+fn ai_config_path(guard: &crate::storage::StorageGuard) -> Result<PathBuf, String> {
+    let target = data_root()?.join(AI_CONFIG_FILE);
+    migrate_legacy_ai_config(guard, &target)?;
+    Ok(target)
+}
+
+fn data_root() -> Result<PathBuf, String> {
+    crate::library::library_root()
+}
+
+fn migrate_legacy_ai_config(
+    guard: &crate::storage::StorageGuard,
+    target: &Path,
+) -> Result<(), String> {
+    #[cfg(not(debug_assertions))]
+    {
+        if target.exists() {
+            return Ok(());
+        }
+        let exe =
+            std::env::current_exe().map_err(|error| format!("无法定位当前 exe 路径：{error}"))?;
+        let exe_parent = exe
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法定位 exe 所在目录。".to_owned())?;
+        migrate_legacy_ai_config_at(guard, target, &exe_parent)?;
+    }
+    let _ = (guard, target);
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn migrate_legacy_ai_config_at(
+    guard: &crate::storage::StorageGuard,
+    target: &Path,
+    exe_parent: &Path,
+) -> Result<(), String> {
+    {
+        let legacy_data_dir = exe_parent.join(DATA_SUBDIR);
+        let legacy = [
+            legacy_data_dir.join(AI_CONFIG_FILE),
+            exe_parent.join(AI_CONFIG_FILE),
+        ]
+        .into_iter()
+        .find(|path| path.exists());
+        let Some(legacy) = legacy else {
+            return Ok(());
+        };
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("无法创建 AI 配置目录 {}：{error}", parent.display()))?;
+        }
+        crate::storage::rename(guard, &legacy, target).map_err(|error| {
+            format!(
+                "无法迁移旧 AI 配置 {} 到 {}：{error}",
+                legacy.display(),
+                target.display()
+            )
+        })?;
+        if legacy_data_dir.exists()
+            && legacy_data_dir
+                .read_dir()
+                .map_err(|error| {
+                    format!(
+                        "无法读取旧 AI 配置目录 {}：{error}",
+                        legacy_data_dir.display()
+                    )
+                })?
+                .next()
+                .is_none()
+        {
+            fs::remove_dir(&legacy_data_dir).map_err(|error| {
+                format!(
+                    "无法删除空旧 AI 配置目录 {}：{error}",
+                    legacy_data_dir.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_required(name: &str, value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(format!("{name} 不能为空。"))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn non_empty_or_stored(value: Option<String>, stored: &str) -> String {
+    let value = value.unwrap_or_default().trim().to_owned();
+    if value.is_empty() {
+        stored.trim().to_owned()
+    } else {
+        value
+    }
+}
+
+fn key_hint(api_key: &str) -> Option<String> {
+    if api_key.is_empty() {
+        return None;
+    }
+    let mut tail: Vec<char> = api_key.chars().rev().take(4).collect();
+    tail.reverse();
+    Some(format!("••••{}", tail.into_iter().collect::<String>()))
+}
+
+pub(super) fn safe_error(message: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        return message.to_owned();
+    }
+    message.replace(api_key, "[redacted]")
+}
+
+fn ai_request_error(is_timeout: bool, message: &str, context: &str, api_key: &str) -> String {
+    if is_timeout {
+        "AI 请求超时，模型响应过慢或网络不稳定，请稍后重试或更换模型。".to_owned()
+    } else {
+        format!("{context}{}", safe_error(message, api_key))
+    }
+}
+
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs().min(i64::MAX as u64) as i64)
+}
+
+pub(crate) fn validate_import_json(file_name: &str, bytes: &[u8]) -> Result<(), String> {
+    match file_name {
+        AI_CONFIG_FILE => {
+            let parsed: AiConfig =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            parsed.ensure_supported_version(Path::new(file_name))
+        }
+        RECOMMENDATIONS_FILE => {
+            crate::library::validate_json_bytes::<RecommendationsFile>(file_name, bytes)
+        }
+        _ => unreachable!("AI backup dispatch must use a declared file"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ai_request_error, chat_completion_with_config, filter_known_bvids, key_hint,
+        parse_search_intents, read_ai_config_from_path, read_saved_recommendations_from_path,
+        write_ai_config, write_recommendations_to_path, AiConfig, ApiFormat, ChatMessage,
+        AI_CONFIG_FILE, VERSION,
+    };
+    use crate::search::SearchVideo;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn serializes_and_deserializes_ai_config() {
+        let mut config = AiConfig {
+            version: VERSION,
+            api_format: ApiFormat::OpenAiChatCompletions,
+            base_url: "https://api.example.com/v1".to_owned(),
+            model: "test-model".to_owned(),
+            api_key: "sk-secret".to_owned(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AiConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, config);
+        assert!(json.contains("\"version\":1"));
+        assert!(json.contains("\"api_format\":\"openai-chat-completions\""));
+
+        config.api_format = ApiFormat::AnthropicMessages;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"api_format\":\"anthropic-messages\""));
+    }
+
+    #[test]
+    fn v1_config_without_format_defaults_to_openai_chat_completions() {
+        let config = r#"{
+            "version": 1,
+            "base_url": "https://api.example.com/v1",
+            "model": "test-model",
+            "api_key": "sk-secret"
+        }"#;
+        let parsed: AiConfig = serde_json::from_str(config).unwrap();
+
+        assert_eq!(parsed.api_format, ApiFormat::OpenAiChatCompletions);
+        let path = unique_temp_path("v1-no-format");
+        fs::write(&path, config).unwrap();
+        let loaded = read_ai_config_from_path(&crate::storage::lock_storage().unwrap(), &path);
+        let _ = fs::remove_file(&path);
+
+        assert!(loaded.is_ok());
+        assert_eq!(loaded.unwrap().api_format, ApiFormat::OpenAiChatCompletions);
+    }
+
+    #[test]
+    fn v2_config_is_rejected_without_overwriting() {
+        let path = unique_temp_path("v2-unsupported");
+        let config = r#"{"version":2,"api_format":"openai-responses","base_url":"https://api.example.com/v1","model":"test-model","api_key":"sk-secret"}"#;
+        fs::write(&path, config).unwrap();
+        let result = read_ai_config_from_path(&crate::storage::lock_storage().unwrap(), &path);
+        let unchanged = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(result.unwrap_err().contains("版本 2 暂不支持"));
+        assert_eq!(unchanged, config);
+    }
+
+    #[test]
+    fn unknown_api_format_is_rejected() {
+        assert!(ApiFormat::parse("openai").is_err());
+        assert!(ApiFormat::parse("anthropic").is_err());
+        assert!(ApiFormat::parse("openai-chat").is_err());
+        assert_eq!(
+            ApiFormat::parse(" openai-responses ").unwrap(),
+            ApiFormat::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn atomic_write_reads_back_ai_config() {
+        let path = unique_temp_path("write-read");
+        let config = AiConfig {
+            version: VERSION,
+            api_format: ApiFormat::AnthropicMessages,
+            base_url: "https://api.example.com/v1".to_owned(),
+            model: "test-model".to_owned(),
+            api_key: "sk-secret".to_owned(),
+        };
+
+        write_ai_config(&crate::storage::lock_storage().unwrap(), &path, &config).unwrap();
+        let parsed =
+            read_ai_config_from_path(&crate::storage::lock_storage().unwrap(), &path).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(parsed, config);
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.api_format, ApiFormat::AnthropicMessages);
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["api_format"], "anthropic-messages");
+    }
+
+    #[test]
+    fn config_view_never_contains_plain_api_key() {
+        let config = AiConfig {
+            version: VERSION,
+            api_format: ApiFormat::OpenAiChatCompletions,
+            base_url: "https://api.example.com/v1".to_owned(),
+            model: "test-model".to_owned(),
+            api_key: "sk-secret-1234".to_owned(),
+        };
+        let view = config.view();
+        let json = serde_json::to_string(&view).unwrap();
+
+        assert_eq!(view.api_format, "openai-chat-completions");
+        assert!(view.has_key);
+        assert_eq!(key_hint(&config.api_key).as_deref(), Some("••••1234"));
+        assert!(!json.contains(&config.api_key));
+        assert!(json.contains("1234"));
+    }
+
+    #[test]
+    fn key_hint_preserves_four_bullets_and_last_four_unicode_characters() {
+        for (key, expected) in [
+            ("", None),
+            ("a", Some("••••a")),
+            ("ab", Some("••••ab")),
+            ("abc", Some("••••abc")),
+            ("abcd", Some("••••abcd")),
+            ("prefix-1234", Some("••••1234")),
+            ("prefix-甲乙丙丁", Some("••••甲乙丙丁")),
+            ("prefix-甲😀乙🎵", Some("••••甲😀乙🎵")),
+        ] {
+            assert_eq!(key_hint(key).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn bad_ai_config_file_returns_error_without_overwriting() {
+        let path = unique_temp_path("bad-file");
+        fs::write(&path, "{ not json").unwrap();
+
+        let result = read_ai_config_from_path(&crate::storage::lock_storage().unwrap(), &path);
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_err());
+        assert_eq!(contents, "{ not json");
+    }
+
+    #[test]
+    fn recommendations_round_trip_and_bad_file_falls_back_to_empty() {
+        let path = unique_temp_path("recommendations");
+        let items = [SearchVideo {
+            bvid: "BV1xx411c7mD".to_owned(),
+            title: "Real A".to_owned(),
+            uploader: "UP A".to_owned(),
+            thumbnail_url: "https://example.com/cover.jpg".to_owned(),
+            duration_seconds: 180,
+            play_count: Some(100),
+            pubdate: Some(1_700_000_000),
+        }];
+
+        write_recommendations_to_path(&crate::storage::lock_storage().unwrap(), &path, &items)
+            .unwrap();
+        let saved =
+            read_saved_recommendations_from_path(&crate::storage::lock_storage().unwrap(), &path);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].bvid, items[0].bvid);
+
+        fs::write(&path, "{ not json").unwrap();
+        assert!(read_saved_recommendations_from_path(
+            &crate::storage::lock_storage().unwrap(),
+            &path
+        )
+        .is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timeout_errors_are_explained_in_chinese() {
+        assert_eq!(
+            ai_request_error(true, "error sending request", "AI 请求失败：", "sk-secret"),
+            "AI 请求超时，模型响应过慢或网络不稳定，请稍后重试或更换模型。"
+        );
+    }
+
+    #[test]
+    fn recommendation_json_parsing_is_defensive() {
+        let fenced = "```json\n[{\"keyword\":\"vocaloid\",\"reason\":\"常搜\"}]\n```";
+        let missing = "[{\"reason\":\"missing keyword\"}]";
+        let garbage = "not json at all";
+
+        assert_eq!(parse_search_intents(fenced).len(), 1);
+        assert!(parse_search_intents(missing).is_empty());
+        assert!(parse_search_intents(garbage).is_empty());
+    }
+
+    #[test]
+    fn rerank_bvid_validation_drops_unknown_ids() {
+        let candidates = [
+            SearchVideo {
+                bvid: "BV1xx411c7mD".to_owned(),
+                title: "Real A".to_owned(),
+                uploader: "UP A".to_owned(),
+                thumbnail_url: String::new(),
+                duration_seconds: 180,
+                play_count: Some(100),
+                pubdate: None,
+            },
+            SearchVideo {
+                bvid: "BV1yy411c7mD".to_owned(),
+                title: "Real B".to_owned(),
+                uploader: "UP B".to_owned(),
+                thumbnail_url: String::new(),
+                duration_seconds: 180,
+                play_count: Some(50),
+                pubdate: None,
+            },
+        ];
+        let ordered = filter_known_bvids(
+            vec![
+                "BV_FAKE_0000".to_owned(),
+                "BV1yy411c7mD".to_owned(),
+                "BV1yy411c7mD".to_owned(),
+                "BV1xx411c7mD".to_owned(),
+            ],
+            candidates.iter().map(|video| video.bvid.as_str()),
+        );
+
+        assert_eq!(ordered, vec!["BV1yy411c7mD", "BV1xx411c7mD"]);
+    }
+
+    fn chat_config(api_format: ApiFormat, base_url: &str) -> AiConfig {
+        AiConfig {
+            version: VERSION,
+            api_format,
+            base_url: base_url.to_owned(),
+            model: "test-model".to_owned(),
+            api_key: "sk-secret".to_owned(),
+        }
+    }
+
+    /// 启动一次性本地 mock 服务器，任意路径都返回固定响应。
+    fn spawn_mock_server(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 16384];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn chat_completion_end_to_end_per_format() {
+        let cases = [
+            (
+                ApiFormat::OpenAiChatCompletions,
+                r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+            ),
+            (
+                ApiFormat::OpenAiResponses,
+                r#"{"object":"response","output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"思考"}]},{"type":"message","content":[{"type":"output_text","text":"pong"}]}]}"#,
+            ),
+            (
+                ApiFormat::AnthropicMessages,
+                r#"{"content":[{"type":"thinking","thinking":"思考"},{"type":"text","text":"pong"}]}"#,
+            ),
+        ];
+        for (format, body) in cases {
+            let base = spawn_mock_server("200 OK", body);
+            let config = chat_config(format, &base);
+            let result = tauri::async_runtime::block_on(chat_completion_with_config(
+                &config,
+                vec![ChatMessage {
+                    role: "user",
+                    content: "ping".to_owned(),
+                }],
+                512,
+                10,
+            ))
+            .unwrap();
+            assert_eq!(result, "pong");
+        }
+    }
+
+    #[test]
+    fn response_body_errors_redact_api_key() {
+        for status in ["400 Bad Request", "200 OK"] {
+            let base = spawn_mock_server(status, r#"{"error":"sk-secret"}"#);
+            let config = chat_config(ApiFormat::OpenAiChatCompletions, &base);
+            let error = tauri::async_runtime::block_on(chat_completion_with_config(
+                &config,
+                vec![ChatMessage {
+                    role: "user",
+                    content: "ping".to_owned(),
+                }],
+                512,
+                10,
+            ))
+            .unwrap_err();
+
+            assert!(!error.contains(&config.api_key));
+            assert!(error.contains("[redacted]"));
+        }
+    }
+
+    #[test]
+    fn recommendation_keyword_responses_use_the_real_http_and_protocol_parsers() {
+        let cases = [
+            (
+                ApiFormat::OpenAiChatCompletions,
+                r#"{"choices":[{"finish_reason":"stop","message":{"content":"[{\"keyword\":\"摇滚 现场\",\"reason\":\"测试\"}]"}}]}"#,
+            ),
+            (
+                ApiFormat::OpenAiResponses,
+                r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"[{\"keyword\":\"摇滚 现场\"}]"}]}]}"#,
+            ),
+            (
+                ApiFormat::AnthropicMessages,
+                r#"{"stop_reason":"end_turn","content":[{"type":"thinking","thinking":"","signature":""},{"type":"text","text":"[{\"keyword\":\"摇滚 现场\"}]"}]}"#,
+            ),
+        ];
+        for (format, body) in cases {
+            let base = spawn_mock_server("200 OK", body);
+            let config = chat_config(format, &base);
+            let intents =
+                tauri::async_runtime::block_on(super::generate_search_intents(&config, "合成口味"))
+                    .unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].keyword, "摇滚 现场");
+        }
+    }
+
+    #[test]
+    fn recommendation_errors_do_not_echo_response_content_and_truncation_is_rejected() {
+        for (format, status, body) in [
+            (
+                ApiFormat::OpenAiChatCompletions,
+                "400 Bad Request",
+                r#"{"error":"sk-secret private-profile"}"#,
+            ),
+            (
+                ApiFormat::OpenAiChatCompletions,
+                "200 OK",
+                "sk-secret private-profile",
+            ),
+            (
+                ApiFormat::OpenAiChatCompletions,
+                "200 OK",
+                r#"{"choices":[{"finish_reason":"length","message":{"content":"[] private-profile"}}]}"#,
+            ),
+            (
+                ApiFormat::OpenAiResponses,
+                "200 OK",
+                r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}"#,
+            ),
+            (
+                ApiFormat::AnthropicMessages,
+                "200 OK",
+                r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"[] private-profile"}]}"#,
+            ),
+        ] {
+            let base = spawn_mock_server(status, body);
+            let config = chat_config(format, &base);
+            let error =
+                tauri::async_runtime::block_on(super::generate_search_intents(&config, "合成口味"))
+                    .unwrap_err();
+            assert!(!error.contains("sk-secret"));
+            assert!(!error.contains("private-profile"));
+            if body.contains("length") || body.contains("max_tokens") || body.contains("incomplete")
+            {
+                assert!(error.contains("截断"));
+            }
+        }
+    }
+
+    #[test]
+    fn recommendation_http_timeout_covers_stalled_response_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 8192]);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10000\r\n\r\n{").unwrap();
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        let config = chat_config(ApiFormat::OpenAiChatCompletions, &base);
+        let error = tauri::async_runtime::block_on(super::chat_completion_with_purpose(
+            &config,
+            vec![ChatMessage {
+                role: "user",
+                content: "合成测试".to_owned(),
+            }],
+            2000,
+            1,
+            super::RequestPurpose::Recommendation,
+        ))
+        .unwrap_err();
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(error.contains("超时"));
+    }
+
+    #[test]
+    fn ai_root_matches_library_root_without_creating_it() {
+        let expected = crate::library::library_root().unwrap();
+        let existed = expected.exists();
+        assert_eq!(super::data_root().unwrap(), expected);
+        assert_eq!(expected.exists(), existed);
+    }
+
+    #[test]
+    fn existing_ai_migration_target_short_circuits_without_exe_access() {
+        let target = unique_temp_path("migration-existing");
+        fs::write(&target, b"existing").unwrap();
+        assert!(target.exists());
+        super::migrate_legacy_ai_config(&crate::storage::lock_storage().unwrap(), &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        fs::remove_file(target).unwrap();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_ai_migration_prefers_data_and_removes_empty_directory() {
+        let root = unique_temp_path("migration-priority");
+        let exe = root.join("exe");
+        let data = exe.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join(AI_CONFIG_FILE), b"data").unwrap();
+        fs::write(exe.join(AI_CONFIG_FILE), b"exe").unwrap();
+        let target = root.join("destination").join(AI_CONFIG_FILE);
+        super::migrate_legacy_ai_config_at(&crate::storage::lock_storage().unwrap(), &target, &exe)
+            .unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"data");
+        assert_eq!(fs::read(exe.join(AI_CONFIG_FILE)).unwrap(), b"exe");
+        assert!(!data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_ai_migration_keeps_other_files_and_nonempty_directory() {
+        let root = unique_temp_path("migration-only-config");
+        let exe = root.join("exe");
+        let data = exe.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join(AI_CONFIG_FILE), b"data").unwrap();
+        fs::write(data.join("favorites.json"), b"keep").unwrap();
+        fs::write(exe.join("favorites.json"), b"keep-exe").unwrap();
+        let target = root.join("destination").join(AI_CONFIG_FILE);
+        super::migrate_legacy_ai_config_at(&crate::storage::lock_storage().unwrap(), &target, &exe)
+            .unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"data");
+        assert_eq!(fs::read(data.join("favorites.json")).unwrap(), b"keep");
+        assert_eq!(fs::read(exe.join("favorites.json")).unwrap(), b"keep-exe");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_ai_migration_falls_back_to_exe_directory() {
+        let root = unique_temp_path("migration-fallback");
+        let exe = root.join("exe");
+        fs::create_dir_all(&exe).unwrap();
+        fs::write(exe.join(AI_CONFIG_FILE), b"exe").unwrap();
+        let target = root.join("destination").join(AI_CONFIG_FILE);
+        super::migrate_legacy_ai_config_at(&crate::storage::lock_storage().unwrap(), &target, &exe)
+            .unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"exe");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bilibili-music-{label}-{}-{nanos}-{AI_CONFIG_FILE}",
+            std::process::id()
+        ))
+    }
+}

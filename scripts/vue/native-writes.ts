@@ -1,0 +1,75 @@
+import assert from "node:assert/strict";
+import path from "node:path";
+import ts from "typescript";
+
+type NativeWrite={file:string;line:number;expression:string};
+function collectNativeWrites(root:string):NativeWrite[] {
+  const config=ts.readConfigFile(path.join(root,"scripts/typecheck/tsconfig.main.json"),ts.sys.readFile);
+  const parsed=ts.parseJsonConfigFileContent(config.config,ts.sys,path.join(root,"scripts/typecheck"));
+  const program=ts.createProgram([...new Set([...parsed.fileNames,...ts.sys.readDirectory(path.join(root,"ui"),[".ts"])])],parsed.options),checker=program.getTypeChecker(),writes:NativeWrite[]=[];
+  const domDeclaration=(symbol:ts.Symbol|undefined)=>symbol?.declarations?.some(declaration=>/\/lib\.dom\.d\.ts$/.test(declaration.getSourceFile().fileName.replaceAll("\\","/"))) ?? false;
+  function nativeType(type:ts.Type):boolean {
+    if(type.isUnion())return type.types.some(nativeType);
+    const symbol=type.getSymbol();
+    if(domDeclaration(symbol) && ["Node","Element","CSSStyleDeclaration","DOMStringMap","DOMTokenList"].includes(symbol!.name))return true;
+    return Boolean(type.flags & ts.TypeFlags.Object) && Boolean((type as ts.ObjectType).objectFlags & (ts.ObjectFlags.Class|ts.ObjectFlags.Interface)) && (checker.getBaseTypes(type as ts.InterfaceType)??[]).some(nativeType);
+  }
+  function domMember(node:ts.Expression):boolean {
+    if(!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node))return false;
+    const receiver=checker.getNonNullableType(checker.getTypeAtLocation(node.expression));
+    return nativeType(receiver);
+  }
+  for(const source of program.getSourceFiles()) {
+    const file=path.relative(root,source.fileName).replaceAll("\\","/");
+    if(!file.startsWith("ui/") || file.includes("/components/") || source.isDeclarationFile || ["ui/app/root-mount.ts","ui/mini/root-mount.ts"].includes(file))continue;
+    function visit(node:ts.Node):void {
+      let target:ts.Expression|undefined;
+      if(ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment)target=node.left;
+      if((ts.isPrefixUnaryExpression(node)||ts.isPostfixUnaryExpression(node)) && [ts.SyntaxKind.PlusPlusToken,ts.SyntaxKind.MinusMinusToken].includes(node.operator))target=node.operand;
+      if(ts.isDeleteExpression(node))target=node.expression;
+      if(ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ["setAttribute","removeAttribute","toggleAttribute","append","appendChild","prepend","replaceChildren","replaceChild","removeChild","insertBefore","insertAdjacentHTML","insertAdjacentElement","insertAdjacentText","before","after","replaceWith","setAttributeNS","removeAttributeNS","remove","add","toggle","replace","setProperty","removeProperty"].includes(node.expression.name.text))target=node.expression;
+      if(ts.isCallExpression(node) && ["Object.assign","Object.defineProperty","Reflect.set","Reflect.deleteProperty"].includes(node.expression.getText(source)) && node.arguments[0] && nativeType(checker.getNonNullableType(checker.getTypeAtLocation(node.arguments[0]))))writes.push({file,line:source.getLineAndCharacterOfPosition(node.getStart()).line+1,expression:node.getText(source).replace(/\s+/g," ")});
+      if(target && !(ts.isPropertyAccessExpression(target) && /^on[a-z]/.test(target.name.text)) && domMember(target))writes.push({file,line:source.getLineAndCharacterOfPosition(node.getStart()).line+1,expression:node.getText(source).replace(/\s+/g," ")});
+      ts.forEachChild(node,visit);
+    }
+    visit(source);
+  }
+  return writes;
+}
+const allowedWrites:Readonly<Record<string,string>>={
+  "ui/features/settings/dynamic-background.ts:canvas.width = 96": "离屏背景图采样；不写 Vue 宿主",
+  "ui/features/settings/dynamic-background.ts:canvas.height = Math.max(1, Math.round(96 * height / width))": "离屏背景图按窗口比例采样",
+  "ui/features/settings/dynamic-background.ts:decoded.src = next": "复用背景加载投影，只解码 data URL；不新增监听",
+  "ui/features/settings/dynamic-background.ts:loadingImage.src = \"\"": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:image.crossOrigin = \"anonymous\"": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:image.referrerPolicy = \"no-referrer\"": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:image.decoding = \"async\"": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:canvas.width = canvas.height = 32": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:canvas.height = 32": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:image.src = \"\"": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/features/settings/dynamic-background.ts:image.src = source": "离屏 Image/canvas 采样，不进入应用树",
+  "ui/shared/root-style.ts:root.dataset[name] = value": "documentElement 属性投影的唯一出口；业务代码不直接写 <html>",
+  "ui/shared/root-style.ts:delete root.dataset[name]": "documentElement 属性投影的唯一出口",
+  "ui/shared/root-style.ts:root.style.setProperty(name, value)": "documentElement CSS 变量投影的唯一出口",
+  "ui/shared/root-style.ts:root.style.removeProperty(name)": "documentElement CSS 变量投影的唯一出口",
+  "ui/features/playback/playback-core.ts:audio.removeAttribute(\"src\")": "Vue 宿主外唯一 audio",
+  "ui/features/playback/playback-core.ts:audio.src = info.audioUrl": "Vue 宿主外唯一 audio",
+  "ui/features/playback/playback-core.ts:audio.currentTime = Math.min(Math.max(0, position), maxPosition)": "Vue 宿主外唯一 audio",
+  "ui/features/playback/playback-core.ts:audio.currentTime = Math.min( Math.max(0, Number(resumePosition) || 0), Number.isFinite(maxPosition) ? maxPosition : 0, )": "Vue 宿主外唯一 audio",
+  "ui/features/immersive/lyrics.ts:linesElement.scrollTop = 0": "歌词几何滚动副作用",
+  "ui/shared/custom-palette.ts:image.decoding = \"async\"": "离屏 Image/canvas 采样取色，不进入应用树",
+  "ui/shared/custom-palette.ts:image.src = dataUrl": "离屏 Image/canvas 采样取色，不进入应用树",
+  "ui/shared/custom-palette.ts:canvas.width = SAMPLE_SIZE": "离屏 Image/canvas 采样取色，不进入应用树",
+  "ui/shared/custom-palette.ts:canvas.height = SAMPLE_SIZE": "离屏 Image/canvas 采样取色，不进入应用树",
+};
+function checkNativeWrites(root:string):void {
+  const used=new Set<string>();
+  for(const write of collectNativeWrites(root)) {
+    const key=write.file+":"+write.expression;
+    assert.ok(allowedWrites[key],`Native UI write: ${write.file}:${write.line}: ${write.expression}`);
+    used.add(key);
+  }
+  for(const key of Object.keys(allowedWrites))assert.ok(used.has(key),"Stale native-write exception: "+key);
+}
+export {checkNativeWrites,collectNativeWrites};
+if(import.meta.main)checkNativeWrites(path.resolve(import.meta.dirname,"../.."));

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"]
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "visible": false,
+        "title": "Pick Up Sound",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 1080,
+        "minHeight": 600,
+        "decorations": true,
+        "dragDropEnabled": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 20, "y": 18 },
+        "resizable": true,
+        "shadow": true
+      }
+    ]
+  }
+}

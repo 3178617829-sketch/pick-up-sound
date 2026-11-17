@@ -1,0 +1,36 @@
+# 编译产物
+/target/
+dist/
+*.exe
+
+# 下载/落盘的音频(违反不落盘原则,任何音频都不进库)
+*.m4a
+*.mp3
+*.flac
+*.aac
+*.wav
+
+# 敏感信息与运行时数据
+cookies.txt
+tools/
+.local-data/
+favorites.json
+playlists.json
+search-history.json
+ai-config.json
+startup-errors.*
+.vs/
+
+# webstorm工程文件
+.idea
+
+# 依赖与杂项
+node_modules/
+.DS_Store
+
+# 本地构建戳
+.build-stamp
+
+# Local cover drafts
+design/bilibili-cover-4x3.jpg
+design/bilibili-cover-4x3.png

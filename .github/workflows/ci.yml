@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: 设置 Node.js 22.23.3（最低 22.18，原生类型擦除）
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.3
+
+      - name: 安装前端开发依赖
+        run: npm ci
+
+      - name: 运行安装后 DOM 测试
+        run: npm run test:dom
+
+      - name: 检查前端构建产物与开发页面
+        run: npm run verify:dist
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: 检查格式
+        run: cargo fmt --all -- --check
+
+      - name: 构建
+        run: cargo build --workspace
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: 校验前端脚本语法
+        shell: bash
+        run: npm run check:ui-syntax
+
+      - name: 运行 Node 测试
+        run: node --test
+
+      - name: 检查前端类型诊断清单
+        run: npm run typecheck
+
+      - name: 检查 Tauri 平台配置一致性
+        if: matrix.os == 'windows-latest'
+        run: node scripts/check-tauri-window-config.ts

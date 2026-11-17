@@ -1,0 +1,179 @@
+:root {
+  color-scheme: dark;
+  --bar-bg: rgba(24, 21, 18, 0.86);
+  --bar-edge: rgba(255, 255, 255, 0.09);
+  --bar-text: #f6efe6;
+  --bar-muted: rgba(246, 239, 230, 0.52);
+  --bar-accent: #c48444;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#bar-root {
+  width: 100%;
+  height: 100%;
+}
+
+.bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  padding: 0 10px 0 8px;
+  border-radius: 12px;
+  background: var(--bar-bg);
+  border: 1px solid var(--bar-edge);
+  /* 阴影是为「浮在桌面上」设计的；条现在贴在任务栏里，投影只会变成四个角外面的黑边。 */
+  box-shadow: none;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  overflow: hidden;
+}
+
+.bar-thumb {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: linear-gradient(150deg, #3a2c20, #221a14);
+  border: 1px solid rgba(196, 132, 68, 0.32);
+}
+
+.bar-thumb svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: var(--bar-accent);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bar[data-playing="true"] .bar-thumb {
+  border-color: rgba(196, 132, 68, 0.6);
+  box-shadow: 0 0 0 1px rgba(196, 132, 68, 0.18) inset;
+}
+
+.bar-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+}
+
+.bar-title {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--bar-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar-lyric {
+  font-size: 12.5px;
+  line-height: 1.35;
+  font-weight: 500;
+  color: var(--bar-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 0.01em;
+}
+
+.bar-lyric.is-empty {
+  color: var(--bar-muted);
+  font-weight: 400;
+}
+
+.bar-ctl {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.bar-btn {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--bar-muted);
+  cursor: pointer;
+  transition: color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+}
+
+.bar-btn svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
+.bar-btn:hover {
+  color: var(--bar-text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.bar-btn:active {
+  transform: scale(0.92);
+}
+
+.bar-btn.is-main {
+  width: 28px;
+  height: 28px;
+  color: #1b1512;
+  background: var(--bar-accent);
+}
+
+.bar-btn.is-main svg {
+  width: 15px;
+  height: 15px;
+}
+
+.bar-btn.is-main:hover {
+  color: #1b1512;
+  background: #d29450;
+}
+
+.bar-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.bar-track span {
+  display: block;
+  height: 100%;
+  background: var(--bar-accent);
+  transition: width 0.4s linear;
+}

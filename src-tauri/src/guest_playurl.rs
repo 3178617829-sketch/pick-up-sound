@@ -1,0 +1,2097 @@
+use bilibili_music_core::{StreamAudioInfo, BILIBILI_REFERER, DESKTOP_USER_AGENT};
+use reqwest::header::{ACCEPT_ENCODING, COOKIE, RANGE, REFERER, SET_COOKIE, USER_AGENT};
+use reqwest::redirect::Policy;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+
+const HOME_URL: &str = "https://www.bilibili.com/";
+const SPI_URL: &str = "https://api.bilibili.com/x/frontend/finger/spi";
+const VIEW_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/view";
+const PLAYURL_URL: &str = "https://api.bilibili.com/x/player/wbi/playurl";
+const AUDIO_PROBE_RANGE: &str = "bytes=0-4095";
+const PREFERRED_AUDIO_IDS: [i64; 2] = [30232, 30216];
+const SPECIAL_AUDIO_IDS: [i64; 2] = [30250, 30251];
+
+#[derive(Clone, Debug, Default)]
+pub struct GuestPageHint {
+    pub cid: Option<u64>,
+    pub page: Option<u32>,
+    pub part: Option<String>,
+    pub duration_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoPage {
+    pub page: u32,
+    pub cid: u64,
+    pub part: String,
+    pub duration_seconds: u64,
+}
+
+pub struct GuestPlayurlClient {
+    client: reqwest::Client,
+    guest_identity: RwLock<Option<GuestIdentity>>,
+    wbi_cache: RwLock<Option<CachedWbiKey>>,
+}
+
+#[derive(Clone)]
+struct CachedWbiKey {
+    mixin_key: String,
+    fetched_at: Instant,
+}
+
+impl GuestPlayurlClient {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            client: build_client()?,
+            guest_identity: RwLock::new(None),
+            wbi_cache: RwLock::new(None),
+        })
+    }
+
+    /// 游客（不登录）解析一条视频的可播放音频地址，返回给前端去喂 `<audio>`。
+    ///
+    /// 顺序固定：bvid 校验 → 游客身份（buvid cookie）→ wbi key → `view` 拿 cid →
+    /// `playurl` 拿音频轨 → 选轨（DASH 优先，新投稿只有 durl 混合流时兜底）→ 探活。
+    ///
+    /// 120 多行的原因：**每过一个网络步骤都跟一次 `ensure_not_cancelled`**——用户切歌要能
+    /// 立刻中断，不能等一个 30 秒超时的请求自己回来；加上 debug 计时块（`diag.*_elapsed`）
+    /// 夹在中间，读代码时要认出「那些 `#[cfg(debug_assertions)]` 块是量耗时的，不影响流程」。
+    ///
+    /// 两个容易踩的点：`page_hint.cid` 优先于 `view.cid`（多 P 视频必须用它，否则播第一 P）；
+    /// `first_working_audio_url` 是**真的发请求探活**、不只看 URL 非空——B 站给的地址常有过期
+    /// 或区域限制，要逐个试到能拿到 206 为止。
+    pub async fn resolve(
+        &self,
+        bvid: &str,
+        page_hint: Option<GuestPageHint>,
+        cancellation: &AtomicBool,
+    ) -> Result<StreamAudioInfo, String> {
+        #[cfg(debug_assertions)]
+        let mut diag = ResolveDiag::new();
+        let bvid = bvid.trim();
+        if !is_valid_bvid(bvid) {
+            return Err(format!("invalid Bilibili BV ID: {bvid}"));
+        }
+
+        ensure_not_cancelled(cancellation)?;
+        #[cfg(debug_assertions)]
+        if debug_force_guest_failure() {
+            return Err("debug forced guest resolve failure".to_owned());
+        }
+
+        let guest = self.guest_identity(cancellation).await?;
+        let cookie_header = guest.cookie_header();
+        ensure_not_cancelled(cancellation)?;
+
+        let mixin_key = self.wbi_key(&cookie_header, cancellation, false).await?;
+        ensure_not_cancelled(cancellation)?;
+
+        let view = fetch_view(
+            &self.client,
+            bvid,
+            &cookie_header,
+            &mixin_key,
+            Some(cancellation),
+            || self.wbi_key(&cookie_header, cancellation, true),
+        )
+        .await?;
+        ensure_not_cancelled(cancellation)?;
+
+        let target_cid = page_hint
+            .as_ref()
+            .and_then(|hint| hint.cid)
+            .unwrap_or(view.cid);
+        #[cfg(debug_assertions)]
+        {
+            diag.playurl_started = Some(Instant::now());
+        }
+        let playurl = fetch_playurl(
+            &self.client,
+            bvid,
+            target_cid,
+            &cookie_header,
+            &mixin_key,
+            Some(cancellation),
+            || self.wbi_key(&cookie_header, cancellation, true),
+        )
+        .await?;
+        #[cfg(debug_assertions)]
+        {
+            diag.playurl_elapsed = diag.playurl_started.take().unwrap().elapsed();
+        }
+        ensure_not_cancelled(cancellation)?;
+
+        // DASH 音频轨优先；新投稿可能只有 durl 混合流，作为兜底。
+        let (audio_url, muxed_preview) = match select_audio(playurl.data.as_ref()) {
+            Ok(audio) => {
+                #[cfg(debug_assertions)]
+                stream_diag_tracks(playurl.data.as_ref(), Some(audio.id));
+                #[cfg(debug_assertions)]
+                {
+                    diag.probe_started = Some(Instant::now());
+                }
+                let audio_url = first_working_audio_url(&self.client, audio).await?;
+                #[cfg(debug_assertions)]
+                {
+                    diag.probe_elapsed = diag.probe_started.take().unwrap().elapsed();
+                }
+                (audio_url.to_owned(), false)
+            }
+            Err(audio_error) => {
+                #[cfg(debug_assertions)]
+                stream_diag_tracks(playurl.data.as_ref(), None);
+                let durl = select_muxed_durl(playurl.data.as_ref());
+                match durl {
+                    Ok(durl) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            diag.probe_started = Some(Instant::now());
+                        }
+                        let url = first_working_muxed_url(&self.client, durl).await?;
+                        #[cfg(debug_assertions)]
+                        {
+                            diag.probe_elapsed = diag.probe_started.take().unwrap().elapsed();
+                        }
+                        (url, true)
+                    }
+                    Err(durl_error) => {
+                        return Err(format!(
+                            "{audio_error}; durl fallback unavailable: {durl_error}"
+                        ));
+                    }
+                }
+            }
+        };
+        ensure_not_cancelled(cancellation)?;
+
+        let title = page_hint
+            .as_ref()
+            .and_then(|hint| hint.part.as_deref())
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .unwrap_or(view.title);
+        let duration_seconds = page_hint
+            .as_ref()
+            .and_then(|hint| hint.duration_seconds)
+            .unwrap_or(view.duration_seconds);
+
+        Ok(StreamAudioInfo {
+            audio_url,
+            title,
+            uploader: view.uploader,
+            thumbnail_url: normalize_url(&view.thumbnail_url),
+            duration_seconds: duration_seconds as f64,
+            muxed_preview,
+        })
+    }
+
+    pub async fn pages(&self, bvid: &str) -> Result<Vec<VideoPage>, String> {
+        let bvid = bvid.trim();
+        if !is_valid_bvid(bvid) {
+            return Err(format!("invalid Bilibili BV ID: {bvid}"));
+        }
+
+        let cancellation = AtomicBool::new(false);
+        let guest = self.guest_identity(&cancellation).await?;
+        let cookie_header = guest.cookie_header();
+        let mixin_key = self.wbi_key(&cookie_header, &cancellation, false).await?;
+        let view = fetch_view(
+            &self.client,
+            bvid,
+            &cookie_header,
+            &mixin_key,
+            Some(&cancellation),
+            || self.wbi_key(&cookie_header, &cancellation, true),
+        )
+        .await?;
+        Ok(view.pages)
+    }
+
+    pub async fn guest_cookie_header(&self) -> Result<String, String> {
+        let cancellation = AtomicBool::new(false);
+        let guest = self.guest_identity(&cancellation).await?;
+        Ok(guest.cookie_header())
+    }
+
+    async fn guest_identity(&self, cancellation: &AtomicBool) -> Result<GuestIdentity, String> {
+        if let Some(identity) = self.guest_identity.read().await.as_ref().cloned() {
+            return Ok(identity);
+        }
+
+        ensure_not_cancelled(cancellation)?;
+        let identity = issue_guest_identity(&self.client, Some(cancellation)).await?;
+        ensure_not_cancelled(cancellation)?;
+        *self.guest_identity.write().await = Some(identity.clone());
+        Ok(identity)
+    }
+
+    async fn wbi_key(
+        &self,
+        cookie_header: &str,
+        cancellation: &AtomicBool,
+        force_refresh: bool,
+    ) -> Result<String, String> {
+        if !force_refresh {
+            if let Some(cached) = self.wbi_cache.read().await.as_ref() {
+                if cached.fetched_at.elapsed() < crate::wbi::WBI_CACHE_TTL {
+                    return Ok(cached.mixin_key.clone());
+                }
+            }
+        }
+
+        ensure_not_cancelled(cancellation)?;
+        let mixin_key = crate::wbi::fetch_mixin_key_cancellable(
+            &self.client,
+            Some(cookie_header),
+            cancellation,
+        )
+        .await?;
+        ensure_not_cancelled(cancellation)?;
+        *self.wbi_cache.write().await = Some(CachedWbiKey {
+            mixin_key: mixin_key.clone(),
+            fetched_at: Instant::now(),
+        });
+        Ok(mixin_key)
+    }
+}
+
+// Drop also reports early errors/cancellation without changing resolve's return paths.
+#[cfg(debug_assertions)]
+struct ResolveDiag {
+    started: Instant,
+    playurl_started: Option<Instant>,
+    playurl_elapsed: Duration,
+    probe_started: Option<Instant>,
+    probe_elapsed: Duration,
+}
+
+#[cfg(debug_assertions)]
+impl ResolveDiag {
+    fn new() -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            playurl_started: None,
+            playurl_elapsed: Duration::ZERO,
+            probe_started: None,
+            probe_elapsed: Duration::ZERO,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for ResolveDiag {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        let playurl = self
+            .playurl_started
+            .map(|start| start.elapsed())
+            .unwrap_or(self.playurl_elapsed);
+        let probe = self
+            .probe_started
+            .map(|start| start.elapsed())
+            .unwrap_or(self.probe_elapsed);
+        eprintln!(
+            "[stream-diag] resolve exit timestamp={:?} id={:?} 本次解析总耗时 {}ms，其中 playurl 请求 {}ms，probe 合计 {}ms（含候选遍历及诊断日志）",
+            SystemTime::now(), self.started, total.as_millis(), playurl.as_millis(), probe.as_millis()
+        );
+    }
+}
+
+async fn first_working_audio_url<'a>(
+    client: &reqwest::Client,
+    audio: &'a AudioStream,
+) -> Result<&'a str, String> {
+    let candidates = ordered_candidates(audio);
+    #[cfg(debug_assertions)]
+    stream_diag_candidates(audio, &candidates);
+    if candidates.is_empty() {
+        return Err(format!(
+            "selected audio id {} has no baseUrl/base_url or backup URLs",
+            audio.id
+        ));
+    }
+
+    let mut last_error = None;
+    let mut probe_hosts = FailedProbeHosts::default();
+    #[cfg(debug_assertions)]
+    let mut candidate_index = 0;
+    for candidate in candidates {
+        #[cfg(debug_assertions)]
+        {
+            candidate_index += 1;
+        }
+        let (host, should_skip) = probe_hosts.candidate(candidate);
+        if should_skip {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[stream-diag] dash probe candidate={} host={} 跳过：该主机已失败",
+                candidate_index, host
+            );
+            continue;
+        }
+        match probe_audio_url(client, candidate).await {
+            Ok(_probe) => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[stream-diag] dash probe candidate={} host={} HTTP={} 选中第 {} 个候选",
+                    candidate_index, host, _probe.status, candidate_index
+                );
+                return Ok(candidate);
+            }
+            Err(error) => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[stream-diag] dash probe candidate={} host={} error={}",
+                    candidate_index, host, error
+                );
+                probe_hosts.record_failure(host);
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(format!(
+        "all audio URLs for id {} failed probe: {}",
+        audio.id,
+        probe_hosts.failure_detail(last_error)
+    ))
+}
+
+/// durl 兜底专用：逐个候选 probe，且必须验证 MP4 签名（ftyp），
+/// 老 FLV durl 交给 `<audio>` 播不了，宁可失败走现有跳过逻辑。
+async fn first_working_muxed_url(
+    client: &reqwest::Client,
+    durl: &DurlStream,
+) -> Result<String, String> {
+    let candidates = durl.url_candidates();
+    if candidates.is_empty() {
+        return Err("durl entry has no baseUrl/url".to_owned());
+    }
+
+    let mut last_error = None;
+    let mut probe_hosts = FailedProbeHosts::default();
+    #[cfg(debug_assertions)]
+    let mut candidate_index = 0;
+    for candidate in candidates {
+        #[cfg(debug_assertions)]
+        {
+            candidate_index += 1;
+        }
+        let (host, should_skip) = probe_hosts.candidate(candidate);
+        if should_skip {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[stream-diag] durl probe candidate={} host={} 跳过：该主机已失败",
+                candidate_index, host
+            );
+            continue;
+        }
+        match probe_audio_url(client, candidate).await {
+            Ok(probe) => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[stream-diag] durl probe candidate={} host={} HTTP={} mp4={}",
+                    candidate_index,
+                    host,
+                    probe.status,
+                    probe.looks_mp4()
+                );
+                if probe.looks_mp4() {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[stream-diag] durl 选中第 {} 个候选", candidate_index);
+                    return Ok(normalize_url(candidate));
+                }
+                last_error = Some("durl stream is not MP4 (unsupported container)".to_owned());
+            }
+            Err(error) => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[stream-diag] durl probe candidate={} host={} error={}",
+                    candidate_index, host, error
+                );
+                probe_hosts.record_failure(host);
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(format!(
+        "all durl URLs failed probe: {}",
+        probe_hosts.failure_detail(last_error)
+    ))
+}
+
+fn stream_diag_host(url: &str) -> String {
+    // 用于候选失败主机去重与诊断输出，不再仅服务于 debug 日志。
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<invalid-or-missing-host>".to_owned())
+}
+
+#[derive(Default)]
+struct FailedProbeHosts {
+    failed: BTreeSet<String>,
+    skipped: BTreeSet<String>,
+}
+
+impl FailedProbeHosts {
+    fn candidate(&mut self, url: &str) -> (String, bool) {
+        let host = stream_diag_host(url);
+        let should_skip = self.failed.contains(&host);
+        if should_skip {
+            self.skipped.insert(host.clone());
+        }
+        (host, should_skip)
+    }
+
+    fn record_failure(&mut self, host: String) {
+        self.failed.insert(host);
+    }
+
+    fn failure_detail(&self, last_error: Option<String>) -> String {
+        let error = last_error.unwrap_or_else(|| "unknown probe failure".to_owned());
+        if self.skipped.is_empty() {
+            error
+        } else {
+            format!(
+                "{error}; skipped previously failed hosts: {}",
+                self.skipped.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        }
+    }
+}
+
+fn stream_diag_allowed_host(host: &str) -> bool {
+    // 用于候选排序与诊断输出；修改 main.rs 的白名单时此处必须同步。
+    let host = host.to_ascii_lowercase();
+    ["bilivideo.com", "bilivideo.cn"]
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+        || host == "upos-hz-mirrorakam.akamaized.net"
+}
+
+#[cfg(debug_assertions)]
+fn stream_diag_tracks(data: Option<&PlayurlData>, selected_id: Option<i64>) {
+    let tracks = data
+        .and_then(|data| data.dash.as_ref())
+        .map(|dash| dash.audio.as_slice())
+        .unwrap_or_default();
+    eprintln!("[stream-diag] dash.audio count={}", tracks.len());
+    for track in tracks {
+        eprintln!(
+            "[stream-diag] track id={} codecs={:?} mimeType={:?} base_host={} backupUrl_count={} backup_url_count={}",
+            track.id, track.codecs, track.mime_type(),
+            track.base_url().map(stream_diag_host).unwrap_or_else(|| "<none>".to_owned()),
+            track.backup_url_camel.len(), track.backup_url_snake.len()
+        );
+    }
+    eprintln!("[stream-diag] selected audio id={selected_id:?}");
+}
+
+#[cfg(debug_assertions)]
+fn stream_diag_candidates(audio: &AudioStream, ordered: &[&str]) {
+    let sources: Vec<_> = audio
+        .base_url()
+        .into_iter()
+        .map(|url| ("base", url))
+        .chain(
+            audio
+                .backup_url_camel
+                .iter()
+                .map(|url| ("backupUrl", url.as_str()))
+                .filter(|(_, url)| !url.trim().is_empty()),
+        )
+        .chain(
+            audio
+                .backup_url_snake
+                .iter()
+                .map(|url| ("backup_url", url.as_str()))
+                .filter(|(_, url)| !url.trim().is_empty()),
+        )
+        .collect();
+    for (stage, urls) in [
+        ("before", audio.url_candidates()),
+        ("after", ordered.to_vec()),
+    ] {
+        eprintln!("[stream-diag] candidates {stage} count={}", urls.len());
+        for (index, url) in urls.iter().enumerate() {
+            let source = sources
+                .iter()
+                .find(|(_, original)| std::ptr::eq(*original, *url))
+                .map(|(source, _)| *source)
+                .unwrap_or("unknown");
+            let host = stream_diag_host(url);
+            eprintln!(
+                "[stream-diag] {stage} candidate={} source={} host={} mcdn={} allowed_host={}",
+                index + 1,
+                source,
+                host,
+                host.contains("mcdn."),
+                stream_diag_allowed_host(&host)
+            );
+        }
+    }
+}
+
+fn build_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        // 健康连接实测 33–819ms，3 秒未建立连接时换下一个候选的期望收益高于继续等待。
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(30))
+        .redirect(Policy::none())
+        .build()
+        .map_err(|error| format!("failed to create guest playurl client: {error}"))
+}
+
+#[derive(Clone, Debug)]
+struct GuestIdentity {
+    cookies: BTreeMap<String, String>,
+}
+
+fn ensure_not_cancelled(cancellation: &AtomicBool) -> Result<(), String> {
+    if cancellation.load(Ordering::Acquire) {
+        Err("audio resolution was cancelled".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryFailure {
+    Network,
+    HttpResponse,
+}
+
+fn should_retry(failure: RetryFailure, cancelled: bool, retried: bool) -> bool {
+    failure == RetryFailure::Network && !cancelled && !retried
+}
+
+fn check_cancellation(cancellation: Option<&AtomicBool>) -> Result<(), SendError> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err(SendError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn send_with_guest_retry(
+    request: reqwest::RequestBuilder,
+    name: &str,
+    cancellation: Option<&AtomicBool>,
+) -> Result<reqwest::Response, SendError> {
+    check_cancellation(cancellation)?;
+    let retry = request.try_clone();
+    match request.send().await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let network = error.is_connect() || error.is_timeout() || error.is_request();
+            let cancelled = cancellation.is_some_and(|flag| flag.load(Ordering::Acquire));
+            if !should_retry(
+                if network {
+                    RetryFailure::Network
+                } else {
+                    RetryFailure::HttpResponse
+                },
+                cancelled,
+                false,
+            ) || retry.is_none()
+            {
+                check_cancellation(cancellation)?;
+                return Err(SendError::Request(error));
+            }
+            check_cancellation(cancellation)?;
+            #[cfg(debug_assertions)]
+            eprintln!("[guest-retry] {name} attempt=2 reason={error}");
+            #[cfg(not(debug_assertions))]
+            let _ = name;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            check_cancellation(cancellation)?;
+            retry.unwrap().send().await.map_err(SendError::Request)
+        }
+    }
+}
+
+pub(crate) enum SendError {
+    Cancelled,
+    Request(reqwest::Error),
+}
+
+pub(crate) fn format_send_error(error: SendError, prefix: &str) -> String {
+    match error {
+        SendError::Cancelled => "audio resolution was cancelled".to_owned(),
+        SendError::Request(error) => format!("{prefix}: {error}"),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_force_guest_failure() -> bool {
+    matches!(
+        std::env::var("BILIBILI_MUSIC_FORCE_GUEST_FAILURE")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+impl GuestIdentity {
+    fn cookie_header(&self) -> String {
+        self.cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+async fn issue_guest_identity(
+    client: &reqwest::Client,
+    cancellation: Option<&AtomicBool>,
+) -> Result<GuestIdentity, String> {
+    let mut cookies = BTreeMap::new();
+    let response = client
+        .get(HOME_URL)
+        .header(ACCEPT_ENCODING, "identity")
+        .header(USER_AGENT, DESKTOP_USER_AGENT)
+        .header(REFERER, BILIBILI_REFERER);
+    let response = send_with_guest_retry(response, "homepage buvid", cancellation)
+        .await
+        .map_err(|error| {
+            format_send_error(error, "failed to request Bilibili homepage for buvid")
+        })?;
+    if response.status().as_u16() == 412 {
+        return Err("Bilibili homepage returned HTTP 412 while issuing guest buvid".to_owned());
+    }
+
+    for value in response.headers().get_all(SET_COOKIE) {
+        if let Ok(value) = value.to_str() {
+            if let Some((name, value)) = parse_set_cookie(value) {
+                if matches!(name.as_str(), "buvid3" | "buvid4" | "b_nut") {
+                    cookies.insert(name, value);
+                }
+            }
+        }
+    }
+
+    if !cookies.contains_key("buvid3") || !cookies.contains_key("buvid4") {
+        for (name, value) in issue_spi_buvid(client, &cookies, cancellation).await? {
+            cookies.entry(name).or_insert(value);
+        }
+    }
+
+    if !cookies.contains_key("buvid3") {
+        return Err("Bilibili did not issue buvid3 from homepage or SPI".to_owned());
+    }
+    Ok(GuestIdentity { cookies })
+}
+
+async fn issue_spi_buvid(
+    client: &reqwest::Client,
+    existing: &BTreeMap<String, String>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut request = client
+        .get(SPI_URL)
+        .header(ACCEPT_ENCODING, "identity")
+        .header(USER_AGENT, DESKTOP_USER_AGENT)
+        .header(REFERER, BILIBILI_REFERER);
+    if !existing.is_empty() {
+        request = request.header(
+            COOKIE,
+            existing
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+
+    let response = send_with_guest_retry(request, "SPI buvid", cancellation)
+        .await
+        .map_err(|error| format_send_error(error, "failed to request SPI buvid"))?;
+    if response.status().as_u16() == 412 {
+        return Err("Bilibili SPI returned HTTP 412 while issuing buvid".to_owned());
+    }
+    let envelope: SpiEnvelope = response
+        .json()
+        .await
+        .map_err(|error| format!("invalid SPI buvid response: {error}"))?;
+    if envelope.code != 0 {
+        return Err(format!(
+            "SPI buvid failed with code {}: {}",
+            envelope.code, envelope.message
+        ));
+    }
+
+    let mut issued = BTreeMap::new();
+    if !envelope.data.b_3.is_empty() {
+        issued.insert("buvid3".to_owned(), envelope.data.b_3);
+    }
+    if !envelope.data.b_4.is_empty() {
+        issued.insert("buvid4".to_owned(), envelope.data.b_4);
+    }
+    Ok(issued)
+}
+
+fn signed_view_url(bvid: &str, mixin_key: &str, wts: u64) -> String {
+    let params = BTreeMap::from([("bvid".to_owned(), bvid.to_owned())]);
+    let signed_query = crate::wbi::sign_parameters(params, mixin_key, wts);
+    format!("{VIEW_URL}?{signed_query}")
+}
+
+#[derive(Debug)]
+enum WbiAttemptError {
+    RefreshWbi(String),
+    Fatal(String),
+}
+
+async fn with_wbi_refresh<T, A, AF, R, RF>(
+    mixin_key: &str,
+    attempt: A,
+    refresh: R,
+    cancellation: Option<&AtomicBool>,
+) -> Result<T, String>
+where
+    A: Fn(String) -> AF,
+    AF: std::future::Future<Output = Result<T, WbiAttemptError>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+{
+    match attempt(mixin_key.to_owned()).await {
+        Ok(result) => Ok(result),
+        Err(WbiAttemptError::Fatal(error)) => Err(error),
+        Err(WbiAttemptError::RefreshWbi(first_error)) => {
+            check_cancellation(cancellation)
+                .map_err(|error| format_send_error(error, "failed to fetch WBI keys"))?;
+            let refreshed_key = refresh().await?;
+            check_cancellation(cancellation)
+                .map_err(|error| format_send_error(error, "failed to fetch WBI keys"))?;
+            attempt(refreshed_key).await.map_err(|error| match error {
+                WbiAttemptError::RefreshWbi(second_error) => format!(
+                    "Bilibili rejected the refreshed WBI signature: {second_error}; first error: {first_error}"
+                ),
+                WbiAttemptError::Fatal(error) => error,
+            })
+        }
+    }
+}
+
+fn wbi_refresh_reason(body: &[u8]) -> Option<String> {
+    let envelope: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = envelope.get("code")?.as_i64()?;
+    let message = envelope.get("message")?.as_str()?;
+    let has_v_voucher = envelope
+        .get("data")
+        .and_then(|data| data.get("v_voucher"))
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    if !crate::wbi::should_refresh_wbi(code, message, has_v_voucher) {
+        return None;
+    }
+    Some(if code != 0 {
+        format!("code {code}: {message}")
+    } else {
+        "the response contained v_voucher".to_owned()
+    })
+}
+
+async fn fetch_view<R, RF>(
+    client: &reqwest::Client,
+    bvid: &str,
+    cookie_header: &str,
+    mixin_key: &str,
+    cancellation: Option<&AtomicBool>,
+    refresh: R,
+) -> Result<ViewData, String>
+where
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+{
+    fetch_view_with_http(
+        client,
+        bvid,
+        cookie_header,
+        mixin_key,
+        cancellation,
+        VIEW_URL,
+        |request| send_with_guest_retry(request, "view", cancellation),
+        refresh,
+    )
+    .await
+}
+
+async fn fetch_view_with_http<S, SF, R, RF>(
+    client: &reqwest::Client,
+    bvid: &str,
+    cookie_header: &str,
+    mixin_key: &str,
+    cancellation: Option<&AtomicBool>,
+    request_url: &str,
+    send: S,
+    refresh: R,
+) -> Result<ViewData, String>
+where
+    S: Fn(reqwest::RequestBuilder) -> SF,
+    SF: std::future::Future<Output = Result<reqwest::Response, SendError>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+{
+    let send = &send;
+    with_wbi_refresh(mixin_key, |key| async move {
+        fetch_view_once(client, bvid, cookie_header, &key, request_url, send).await
+    }, refresh, cancellation).await
+}
+
+/// 对 `/x/web-interface/view` 发**一次**带 WBI 签名的请求，拿视频基础信息
+/// （`cid` / 标题 / UP / 时长 / 封面）。
+///
+/// 外面套着 `with_wbi_refresh`：签名过期时它会把 `RefreshWbi` 的错误识别出来、
+/// 刷新 key 再进来一次，所以这个函数自己只管「一次尝试」。
+///
+/// `request_url` 是参数而不是常量，是为了测试能把它换成 mock 地址；
+/// 真正的签名由 `signed_view_url` 生成，这里只取它 `?` 后面的 query 拼上去。
+///
+/// 三个头都不是可选的：`REFERER` 缺了会被 B 站防盗链拒；`ACCEPT_ENCODING: identity`
+/// 避免响应被 gzip（排查时肉眼可读）；`USER_AGENT` 必须是桌面 UA，移动端 UA 拿到的
+/// 字段结构不一样。
+///
+/// 412 单独判一次，因为它是**风控**（buvid 或签名被判失效），比普通 5xx 更值得单独说；
+/// 其余错误统一交给 `WbiAttemptError` 分类，交给外层决定是刷新重试还是直接失败。
+async fn fetch_view_once<S, SF>(
+    client: &reqwest::Client,
+    bvid: &str,
+    cookie_header: &str,
+    mixin_key: &str,
+    request_url: &str,
+    send: &S,
+) -> Result<ViewData, WbiAttemptError>
+where
+    S: Fn(reqwest::RequestBuilder) -> SF,
+    SF: std::future::Future<Output = Result<reqwest::Response, SendError>>,
+{
+    let response = async {
+        let request = client
+            .get(format!(
+                "{request_url}?{}",
+                signed_view_url(bvid, mixin_key, unix_timestamp())
+                    .split_once('?')
+                    .unwrap()
+                    .1
+            ))
+            .header(ACCEPT_ENCODING, "identity")
+            .header(USER_AGENT, DESKTOP_USER_AGENT)
+            .header(REFERER, BILIBILI_REFERER)
+            .header(COOKIE, cookie_header);
+        let response = send(request)
+            .await
+            .map_err(|error| format_send_error(error, "Bilibili view request failed"))?;
+        if response.status().as_u16() == 412 {
+            return Err("Bilibili view returned HTTP 412".to_owned());
+        }
+        if !response.status().is_success() {
+            return Err(format!("Bilibili view returned HTTP {}", response.status()));
+        }
+        Ok(response)
+    }
+    .await
+    .map_err(WbiAttemptError::Fatal)?;
+    let response_url = response.url().clone();
+    let body = response.bytes().await.map_err(|error| {
+        WbiAttemptError::Fatal(format!("invalid Bilibili view response: {error}"))
+    })?;
+    if let Some(reason) = wbi_refresh_reason(&body) {
+        return Err(WbiAttemptError::RefreshWbi(reason));
+    }
+    // Replay the same bytes and URL through the original typed JSON decoder so
+    // non-WBI decode errors retain reqwest's original error text.
+    use reqwest::ResponseBuilderExt;
+    let response = reqwest::Response::from(
+        axum::http::Response::builder()
+            .url(response_url)
+            .body(body)
+            .unwrap(),
+    );
+    let parsed = async {
+        let envelope: ViewEnvelope = response
+            .json()
+            .await
+            .map_err(|error| format!("invalid Bilibili view response: {error}"))?;
+        if envelope.code != 0 {
+            // Frontend contract for dynamic codes: failed with code 62002; failed with code -404; failed with code -403.
+            return Err(format!(
+                "Bilibili view failed with code {}: {}",
+                envelope.code, envelope.message
+            ));
+        }
+        let data = envelope
+            .data
+            .ok_or_else(|| "Bilibili view response has no data".to_owned())?;
+        let cid = data
+            .cid
+            .or_else(|| data.pages.first().map(|page| page.cid))
+            .ok_or_else(|| "Bilibili view response has no cid".to_owned())?;
+        let pages = normalize_view_pages(&data.pages, cid, &data.title, data.duration);
+        Ok(ViewData {
+            cid,
+            title: data.title,
+            uploader: data.owner.name,
+            thumbnail_url: data.pic,
+            duration_seconds: data.duration,
+            pages,
+        })
+    }
+    .await;
+    parsed.map_err(WbiAttemptError::Fatal)
+}
+
+fn normalize_view_pages(
+    pages: &[ViewPage],
+    fallback_cid: u64,
+    fallback_title: &str,
+    fallback_duration: u64,
+) -> Vec<VideoPage> {
+    if pages.is_empty() {
+        return vec![VideoPage {
+            page: 1,
+            cid: fallback_cid,
+            part: fallback_title.to_owned(),
+            duration_seconds: fallback_duration,
+        }];
+    }
+
+    pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| VideoPage {
+            page: if page.page == 0 {
+                (index + 1) as u32
+            } else {
+                page.page
+            },
+            cid: page.cid,
+            part: if page.part.trim().is_empty() {
+                fallback_title.to_owned()
+            } else {
+                page.part.clone()
+            },
+            duration_seconds: page.duration.unwrap_or(fallback_duration),
+        })
+        .collect()
+}
+
+async fn fetch_playurl<R, RF>(
+    client: &reqwest::Client,
+    bvid: &str,
+    cid: u64,
+    cookie_header: &str,
+    mixin_key: &str,
+    cancellation: Option<&AtomicBool>,
+    refresh: R,
+) -> Result<PlayurlEnvelope, String>
+where
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+{
+    fetch_playurl_with_http(
+        client,
+        bvid,
+        cid,
+        cookie_header,
+        mixin_key,
+        cancellation,
+        PLAYURL_URL,
+        |request| send_with_guest_retry(request, "playurl", cancellation),
+        refresh,
+    )
+    .await
+}
+
+async fn fetch_playurl_with_http<S, SF, R, RF>(
+    client: &reqwest::Client,
+    bvid: &str,
+    cid: u64,
+    cookie_header: &str,
+    mixin_key: &str,
+    cancellation: Option<&AtomicBool>,
+    request_url: &str,
+    send: S,
+    refresh: R,
+) -> Result<PlayurlEnvelope, String>
+where
+    S: Fn(reqwest::RequestBuilder) -> SF,
+    SF: std::future::Future<Output = Result<reqwest::Response, SendError>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+{
+    let send = &send;
+    with_wbi_refresh(
+        mixin_key,
+        |key| async move {
+            fetch_playurl_once(client, bvid, cid, cookie_header, &key, request_url, send).await
+        },
+        refresh,
+        cancellation,
+    )
+    .await
+}
+
+async fn fetch_playurl_once<S, SF>(
+    client: &reqwest::Client,
+    bvid: &str,
+    cid: u64,
+    cookie_header: &str,
+    mixin_key: &str,
+    request_url: &str,
+    send: &S,
+) -> Result<PlayurlEnvelope, WbiAttemptError>
+where
+    S: Fn(reqwest::RequestBuilder) -> SF,
+    SF: std::future::Future<Output = Result<reqwest::Response, SendError>>,
+{
+    let response = async {
+        let mut params = BTreeMap::new();
+        params.insert("bvid".to_owned(), bvid.to_owned());
+        params.insert("cid".to_owned(), cid.to_string());
+        params.insert("fnval".to_owned(), "4048".to_owned());
+        params.insert("fnver".to_owned(), "0".to_owned());
+        params.insert("qn".to_owned(), "0".to_owned());
+        let signed_query = crate::wbi::sign_parameters(params, mixin_key, unix_timestamp());
+
+        let request = client
+            .get(format!("{request_url}?{signed_query}"))
+            .header(ACCEPT_ENCODING, "identity")
+            .header(USER_AGENT, DESKTOP_USER_AGENT)
+            .header(REFERER, BILIBILI_REFERER)
+            .header(COOKIE, cookie_header);
+        let response = send(request)
+            .await
+            .map_err(|error| format_send_error(error, "Bilibili playurl request failed"))?;
+        if response.status().as_u16() == 412 {
+            return Err("Bilibili playurl returned HTTP 412".to_owned());
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "Bilibili playurl returned HTTP {}",
+                response.status()
+            ));
+        }
+        Ok(response)
+    }
+    .await
+    .map_err(WbiAttemptError::Fatal)?;
+    let content_encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.bytes().await.map_err(|error| {
+        WbiAttemptError::Fatal(format!(
+            "failed to read Bilibili playurl response body: {error}"
+        ))
+    })?;
+    if let Some(reason) = wbi_refresh_reason(&body) {
+        return Err(WbiAttemptError::RefreshWbi(reason));
+    }
+    let parsed = async {
+        let envelope: PlayurlEnvelope = serde_json::from_slice(&body).map_err(|error| {
+            format!(
+                "invalid Bilibili playurl response: {error}; content-encoding={}; first-bytes-hex={}; first-text={}",
+                content_encoding.as_deref().unwrap_or("<none>"),
+                first_bytes_hex(&body),
+                first_text_lossy(&body)
+            )
+        })?;
+        if envelope.code != 0 {
+            return Err(format!(
+                "Bilibili playurl failed with code {}: {}",
+                envelope.code, envelope.message
+            ));
+        }
+        Ok(envelope)
+    }.await;
+    parsed.map_err(WbiAttemptError::Fatal)
+}
+
+fn select_audio(data: Option<&PlayurlData>) -> Result<&AudioStream, String> {
+    let audio = data
+        .and_then(|data| data.dash.as_ref())
+        .map(|dash| dash.audio.as_slice())
+        .ok_or_else(|| "Bilibili playurl response has no data.dash.audio".to_owned())?;
+    if audio.is_empty() {
+        return Err("Bilibili playurl response data.dash.audio is empty".to_owned());
+    }
+
+    for preferred_id in PREFERRED_AUDIO_IDS {
+        if let Some(stream) = audio.iter().find(|stream| stream.id == preferred_id) {
+            return Ok(stream);
+        }
+    }
+
+    audio
+        .iter()
+        .filter(|stream| !SPECIAL_AUDIO_IDS.contains(&stream.id))
+        .find(|stream| stream.looks_browser_playable())
+        .ok_or_else(|| {
+            let ids = audio
+                .iter()
+                .map(|stream| stream.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("no browser-playable AAC audio stream found in data.dash.audio; ids: {ids}")
+        })
+}
+
+/// 新投稿兜底：DASH 音频轨缺失时，回退到 durl 混合流（音视频合一的渐进式 mp4）。
+/// `<audio>` 元素只出音轨，但老视频可能是 FLV 容器，需要 probe 后验证 MP4 签名。
+fn select_muxed_durl(data: Option<&PlayurlData>) -> Result<&DurlStream, String> {
+    let durl = data
+        .and_then(|data| {
+            if data.durl.is_empty() {
+                None
+            } else {
+                Some(&data.durl)
+            }
+        })
+        .ok_or_else(|| "Bilibili playurl response has no data.durl".to_owned())?;
+    Ok(&durl[0])
+}
+
+/// mcdn 边缘节点（P2P 风格 CDN 池）存活时间极短：探测时可能存活、
+/// 播放器真正取流时已 404。因此稳定镜像优先，mcdn 仅作无替代时的兑底。
+fn is_volatile_mcdn_host(url: &str) -> bool {
+    url.split_once("//")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .map(|host| {
+            let host = host.split('@').next().unwrap_or(host);
+            host.contains("mcdn.")
+        })
+        .unwrap_or(false)
+}
+
+/// 候选重排：合规非 mcdn、合规 mcdn、不合规三档，组内严格保序。
+fn ordered_candidates(audio: &AudioStream) -> Vec<&str> {
+    let mut candidates = audio.url_candidates();
+    // 保留第 3 档：所有合规候选都失败时仍会探测它，行为不差于现状，
+    // 且日志能区分“所有合规候选都失败”与“被排序坑了”。
+    candidates.sort_by_key(|url| {
+        let allowed = reqwest::Url::parse(url)
+            .ok()
+            .is_some_and(|url| url.host_str().is_some_and(stream_diag_allowed_host));
+        if !allowed {
+            2
+        } else if is_volatile_mcdn_host(url) {
+            1
+        } else {
+            0
+        }
+    });
+    candidates
+}
+
+async fn probe_audio_url(client: &reqwest::Client, audio_url: &str) -> Result<ProbeResult, String> {
+    #[cfg(debug_assertions)]
+    let started = Instant::now();
+    let response = client
+        .get(audio_url)
+        .header(ACCEPT_ENCODING, "identity")
+        .header(USER_AGENT, DESKTOP_USER_AGENT)
+        .header(REFERER, BILIBILI_REFERER)
+        .header(RANGE, AUDIO_PROBE_RANGE)
+        .send()
+        .await
+        .map_err(|error| {
+            #[cfg(debug_assertions)]
+            eprintln!("[stream-diag] probe host={} elapsed_ms={} bytes=0 Content-Length=<none> Content-Range=<none> error=audio URL probe request failed: {error}", stream_diag_host(audio_url), started.elapsed().as_millis());
+            format!("audio URL probe request failed: {error}")
+        })?;
+    #[cfg(debug_assertions)]
+    let (content_length, content_range) = (
+        response
+            .headers()
+            .get("content-length")
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        response
+            .headers()
+            .get("content-range")
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .unwrap_or_else(|| "<none>".to_owned()),
+    );
+    let status = response.status();
+    if status.as_u16() != 200 && status.as_u16() != 206 {
+        #[cfg(debug_assertions)]
+        eprintln!("[stream-diag] probe host={} elapsed_ms={} bytes=0 Content-Length={} Content-Range={} error=audio URL probe returned HTTP {status}", stream_diag_host(audio_url), started.elapsed().as_millis(), content_length, content_range);
+        return Err(format!("audio URL probe returned HTTP {status}"));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| {
+            #[cfg(debug_assertions)]
+            eprintln!("[stream-diag] probe host={} elapsed_ms={} bytes=<unknown> Content-Length={} Content-Range={} error=failed to read audio probe bytes: {error}", stream_diag_host(audio_url), started.elapsed().as_millis(), content_length, content_range);
+            format!("failed to read audio probe bytes: {error}")
+        })?;
+    #[cfg(debug_assertions)]
+    eprintln!("[stream-diag] probe host={} HTTP={} elapsed_ms={} bytes={} Content-Length={} Content-Range={}", stream_diag_host(audio_url), status.as_u16(), started.elapsed().as_millis(), bytes.len(), content_length, content_range);
+    if bytes.is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[stream-diag] probe host={} elapsed_ms={} error=audio URL probe returned zero bytes",
+            stream_diag_host(audio_url),
+            started.elapsed().as_millis()
+        );
+        return Err("audio URL probe returned zero bytes".to_owned());
+    }
+    Ok(ProbeResult {
+        status: status.as_u16(),
+        head: bytes[..bytes.len().min(16)].to_vec(),
+    })
+}
+
+fn parse_set_cookie(value: &str) -> Option<(String, String)> {
+    let first = value.split(';').next()?;
+    let (name, value) = first.split_once('=')?;
+    if name.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((name.to_owned(), value.to_owned()))
+}
+
+fn first_bytes_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(32)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn first_text_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn normalize_url(value: &str) -> String {
+    if value.starts_with("//") {
+        format!("https:{value}")
+    } else if let Some(value) = value.strip_prefix("http://") {
+        format!("https://{value}")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn is_valid_bvid(value: &str) -> bool {
+    value.len() == 12
+        && value.starts_with("BV")
+        && value[2..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+struct ProbeResult {
+    status: u16,
+    head: Vec<u8>,
+}
+
+impl ProbeResult {
+    /// MP4 文件在偏移 4~8 字节处有 "ftyp" 盒类型标识。
+    fn looks_mp4(&self) -> bool {
+        self.head.len() >= 8 && &self.head[4..8] == b"ftyp"
+    }
+}
+
+#[derive(Deserialize)]
+struct SpiEnvelope {
+    code: i64,
+    message: String,
+    data: SpiData,
+}
+
+#[derive(Deserialize)]
+struct SpiData {
+    b_3: String,
+    b_4: String,
+}
+
+struct ViewData {
+    cid: u64,
+    title: String,
+    uploader: String,
+    thumbnail_url: String,
+    duration_seconds: u64,
+    pages: Vec<VideoPage>,
+}
+
+#[derive(Deserialize)]
+struct ViewEnvelope {
+    code: i64,
+    message: String,
+    data: Option<RawViewData>,
+}
+
+#[derive(Deserialize)]
+struct RawViewData {
+    cid: Option<u64>,
+    title: String,
+    owner: ViewOwner,
+    pic: String,
+    duration: u64,
+    #[serde(default)]
+    pages: Vec<ViewPage>,
+}
+
+#[derive(Deserialize)]
+struct ViewOwner {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ViewPage {
+    #[serde(default)]
+    page: u32,
+    cid: u64,
+    #[serde(default)]
+    part: String,
+    #[serde(default)]
+    duration: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PlayurlEnvelope {
+    code: i64,
+    message: String,
+    data: Option<PlayurlData>,
+}
+
+#[derive(Deserialize)]
+struct PlayurlData {
+    dash: Option<DashData>,
+    /// 新投稿在音频轨转码完成前，playurl 可能只返回 durl（音视频混合流）。
+    #[serde(default)]
+    durl: Vec<DurlStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurlStream {
+    #[serde(default, rename = "baseUrl")]
+    base_url_camel: Option<String>,
+    #[serde(default, rename = "base_url")]
+    base_url_snake: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, rename = "backupUrl")]
+    backup_url_camel: Vec<String>,
+    #[serde(default, rename = "backup_url")]
+    backup_url_snake: Vec<String>,
+}
+
+impl DurlStream {
+    fn url_candidates(&self) -> Vec<&str> {
+        let mut candidates = Vec::new();
+        if let Some(url) = self
+            .base_url_camel
+            .as_deref()
+            .or(self.base_url_snake.as_deref())
+            .or(self.url.as_deref())
+        {
+            if !url.trim().is_empty() {
+                candidates.push(url);
+            }
+        }
+        candidates.extend(
+            self.backup_url_camel
+                .iter()
+                .chain(self.backup_url_snake.iter())
+                .map(String::as_str)
+                .filter(|url| !url.trim().is_empty()),
+        );
+        candidates
+    }
+}
+
+#[derive(Deserialize)]
+struct DashData {
+    #[serde(default)]
+    audio: Vec<AudioStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AudioStream {
+    id: i64,
+    #[serde(default, rename = "baseUrl")]
+    base_url_camel: Option<String>,
+    #[serde(default, rename = "base_url")]
+    base_url_snake: Option<String>,
+    #[serde(default, rename = "backupUrl")]
+    backup_url_camel: Vec<String>,
+    #[serde(default, rename = "backup_url")]
+    backup_url_snake: Vec<String>,
+    #[serde(default)]
+    codecs: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    mime_type_camel: Option<String>,
+    #[serde(default, rename = "mime_type")]
+    mime_type_snake: Option<String>,
+}
+
+impl AudioStream {
+    fn base_url(&self) -> Option<&str> {
+        self.base_url_camel
+            .as_deref()
+            .or(self.base_url_snake.as_deref())
+    }
+
+    fn mime_type(&self) -> Option<&str> {
+        self.mime_type_camel
+            .as_deref()
+            .or(self.mime_type_snake.as_deref())
+    }
+
+    fn url_candidates(&self) -> Vec<&str> {
+        let mut candidates = Vec::new();
+        if let Some(url) = self.base_url() {
+            candidates.push(url);
+        }
+        candidates.extend(
+            self.backup_url_camel
+                .iter()
+                .chain(self.backup_url_snake.iter())
+                .map(String::as_str)
+                .filter(|url| !url.trim().is_empty()),
+        );
+        candidates
+    }
+
+    fn looks_browser_playable(&self) -> bool {
+        let codecs = self
+            .codecs
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mime_type = self.mime_type().unwrap_or_default().to_ascii_lowercase();
+        codecs.contains("mp4a") || mime_type.contains("audio/mp4")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        first_working_audio_url, first_working_muxed_url, ordered_candidates, select_audio,
+        select_muxed_durl, should_retry, signed_view_url, AudioStream, DashData, DurlStream,
+        FailedProbeHosts, PlayurlData, ProbeResult, RetryFailure, VIEW_URL,
+    };
+
+    // Fake HTTP responses only; all request URLs are loopback and are never sent.
+    async fn wbi_http_case(
+        endpoint: &str,
+        bodies: &[serde_json::Value],
+        refresh_error: Option<&str>,
+        cancel_during_refresh: bool,
+        cancel_on_retry: bool,
+    ) -> (Result<(), String>, Vec<reqwest::Url>, usize) {
+        use reqwest::ResponseBuilderExt;
+        use std::sync::{atomic::AtomicUsize, Mutex};
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let requests = Mutex::new(Vec::new());
+        let replies = Mutex::new(
+            bodies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<std::collections::VecDeque<_>>(),
+        );
+        let refreshes = AtomicUsize::new(0);
+        let client = reqwest::Client::new();
+        let send = |builder: reqwest::RequestBuilder| {
+            let request = builder.build().unwrap();
+            let requests = &requests;
+            let replies = &replies;
+            let cancellation = &cancellation;
+            async move {
+                if cancel_on_retry && !requests.lock().unwrap().is_empty() {
+                    cancellation.store(true, super::Ordering::Release);
+                }
+                super::check_cancellation(Some(cancellation))?;
+                assert_eq!(request.url().host_str(), Some("127.0.0.1"));
+                assert_eq!(
+                    request.headers()[reqwest::header::REFERER],
+                    bilibili_music_core::BILIBILI_REFERER
+                );
+                assert_eq!(request.headers()[reqwest::header::COOKIE], "buvid3=fake");
+                requests.lock().unwrap().push(request.url().clone());
+                let body = replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected extra HTTP attempt");
+                Ok(reqwest::Response::from(
+                    axum::http::Response::builder()
+                        .status(200)
+                        .url(request.url().clone())
+                        .body(body)
+                        .unwrap(),
+                ))
+            }
+        };
+        let refresh = || async {
+            refreshes.fetch_add(1, super::Ordering::AcqRel);
+            if cancel_during_refresh {
+                cancellation.store(true, super::Ordering::Release);
+            }
+            if let Some(error) = refresh_error {
+                return Err(error.to_owned());
+            }
+            Ok("new-key".to_owned())
+        };
+        let result = if endpoint == "view" {
+            super::fetch_view_with_http(
+                &client,
+                "BV0000000001",
+                "buvid3=fake",
+                "old-key",
+                Some(&cancellation),
+                "http://127.0.0.1/view",
+                send,
+                refresh,
+            )
+            .await
+            .map(|data| {
+                assert_eq!(data.cid, 11);
+            })
+        } else {
+            super::fetch_playurl_with_http(
+                &client,
+                "BV0000000001",
+                11,
+                "buvid3=fake",
+                "old-key",
+                Some(&cancellation),
+                "http://127.0.0.1/playurl",
+                send,
+                refresh,
+            )
+            .await
+            .map(|data| {
+                assert_eq!(data.code, 0);
+            })
+        };
+        let urls = requests.into_inner().unwrap();
+        for (index, url) in urls.iter().enumerate() {
+            let mut params: super::BTreeMap<String, String> = url
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let wts = params.remove("wts").unwrap().parse().unwrap();
+            let actual = params.remove("w_rid").unwrap();
+            let key = if index == 0 { "old-key" } else { "new-key" };
+            let expected = crate::wbi::sign_parameters(params, key, wts);
+            assert!(
+                expected.ends_with(&format!("w_rid={actual}")),
+                "attempt {index} must sign with {key}"
+            );
+        }
+        (result, urls, refreshes.load(super::Ordering::Acquire))
+    }
+
+    fn wbi_success_body(endpoint: &str) -> serde_json::Value {
+        if endpoint == "view" {
+            serde_json::json!({"code":0,"message":"0","data":{"cid":11,"title":"test","owner":{"name":"test"},"pic":"","duration":20}})
+        } else {
+            serde_json::json!({"code":0,"message":"0","data":{"dash":{"audio":[]}}})
+        }
+    }
+
+    async fn assert_wbi_refresh_success(first: serde_json::Value) {
+        let mut outcomes = Vec::new();
+        let mut attempts = Vec::new();
+        for endpoint in ["view", "playurl"] {
+            let (result, urls, refreshes) = wbi_http_case(
+                endpoint,
+                &[first.clone(), wbi_success_body(endpoint)],
+                None,
+                false,
+                false,
+            )
+            .await;
+            outcomes.push(result);
+            attempts.push((urls.len(), refreshes));
+        }
+        assert_eq!(outcomes, vec![Ok(()), Ok(())]);
+        assert_eq!(attempts, vec![(2, 1), (2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn guest_wbi_message_refreshes_once() {
+        assert_wbi_refresh_success(serde_json::json!({"code":-403,"message":"wbi expired"})).await;
+    }
+
+    #[tokio::test]
+    async fn guest_uppercase_wbi_message_refreshes_once() {
+        assert_wbi_refresh_success(serde_json::json!({"code":-403,"message":"WBI expired"})).await;
+    }
+
+    #[tokio::test]
+    async fn guest_signature_message_refreshes_once() {
+        assert_wbi_refresh_success(serde_json::json!({"code":-403,"message":"签名失效"})).await;
+    }
+
+    #[tokio::test]
+    async fn guest_v_voucher_refreshes_once() {
+        assert_wbi_refresh_success(
+            serde_json::json!({"code":0,"message":"0","data":{"v_voucher":"voucher_test"}}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guest_rejected_refreshed_signature_reports_both_errors_without_more_retries() {
+        for endpoint in ["view", "playurl"] {
+            let first = serde_json::json!({"code":-403,"message":"wbi first"});
+            let second = serde_json::json!({"code":-403,"message":"签名 second"});
+            let (result, urls, refreshes) =
+                wbi_http_case(endpoint, &[first, second], None, false, false).await;
+            assert_eq!(result, Err("Bilibili rejected the refreshed WBI signature: code -403: 签名 second; first error: code -403: wbi first".to_owned()));
+            assert_eq!((urls.len(), refreshes), (2, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_ordinary_business_error_never_refreshes() {
+        for endpoint in ["view", "playurl"] {
+            let body = serde_json::json!({"code":-403,"message":"权限不足"});
+            let (result, urls, refreshes) =
+                wbi_http_case(endpoint, &[body], None, false, false).await;
+            assert_eq!(
+                result,
+                Err(format!(
+                    "Bilibili {endpoint} failed with code -403: 权限不足"
+                ))
+            );
+            assert_eq!((urls.len(), refreshes), (1, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_non_wbi_decode_errors_keep_original_text_and_url() {
+        use reqwest::ResponseBuilderExt;
+        for endpoint in ["view", "playurl"] {
+            for body in [
+                serde_json::json!({"code":"bad","message":"0","data":{}}),
+                serde_json::json!({"code":0,"message":123,"data":{}}),
+                serde_json::json!({"code":-403,"message":"权限不足","data":{"v_voucher":"voucher_test","dash":"bad"}}),
+            ] {
+                let (result, urls, refreshes) =
+                    wbi_http_case(endpoint, &[body.clone()], None, false, false).await;
+                let text = body.to_string();
+                let expected = if endpoint == "view" {
+                    let response = reqwest::Response::from(
+                        axum::http::Response::builder()
+                            .url(urls[0].clone())
+                            .body(text)
+                            .unwrap(),
+                    );
+                    let error = response.json::<super::ViewEnvelope>().await.err().unwrap();
+                    format!("invalid Bilibili view response: {error}")
+                } else {
+                    let error = serde_json::from_slice::<super::PlayurlEnvelope>(text.as_bytes())
+                        .err()
+                        .unwrap();
+                    format!("invalid Bilibili playurl response: {error}; content-encoding=<none>; first-bytes-hex={}; first-text={}", super::first_bytes_hex(text.as_bytes()), super::first_text_lossy(text.as_bytes()))
+                };
+                assert_eq!(result, Err(expected));
+                assert_eq!((urls.len(), refreshes), (1, 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_refresh_failure_and_second_fatal_error_follow_search_error_selection() {
+        for endpoint in ["view", "playurl"] {
+            let first = serde_json::json!({"code":-403,"message":"wbi first"});
+            let (result, urls, refreshes) = wbi_http_case(
+                endpoint,
+                &[first.clone()],
+                Some("key refresh failed"),
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(result, Err("key refresh failed".to_owned()));
+            assert_eq!((urls.len(), refreshes), (1, 1));
+            let second = serde_json::json!({"code":-403,"message":"权限不足"});
+            let (result, urls, refreshes) =
+                wbi_http_case(endpoint, &[first, second], None, false, false).await;
+            assert_eq!(
+                result,
+                Err(format!(
+                    "Bilibili {endpoint} failed with code -403: 权限不足"
+                ))
+            );
+            assert_eq!((urls.len(), refreshes), (2, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_cancellation_during_refresh_or_retry_keeps_cancellation_error() {
+        for endpoint in ["view", "playurl"] {
+            for during_refresh in [true, false] {
+                let first = serde_json::json!({"code":-403,"message":"wbi first"});
+                let (result, urls, refreshes) =
+                    wbi_http_case(endpoint, &[first], None, during_refresh, !during_refresh).await;
+                assert_eq!(result, Err("audio resolution was cancelled".to_owned()));
+                assert_eq!((urls.len(), refreshes), (1, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn cdn_hosts_match_shared_fixture() {
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/cdn-hosts.json")).unwrap();
+        for case in cases {
+            let host = case["host"].as_str().unwrap();
+            assert_eq!(
+                super::stream_diag_allowed_host(host),
+                case["allowed"].as_bool().unwrap(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_url_uses_wbi_signature() {
+        let bvid = "BV1xx411c7mD";
+        let mixin_key = "ea1db124af3c7062474693fa704f4ff8";
+        let wts = 1_702_204_169;
+        let params = std::collections::BTreeMap::from([("bvid".to_owned(), bvid.to_owned())]);
+        let url = signed_view_url(bvid, mixin_key, wts);
+
+        assert_eq!(
+            url,
+            format!(
+                "{VIEW_URL}?{}",
+                crate::wbi::sign_parameters(params, mixin_key, wts)
+            )
+        );
+        assert!(url.starts_with("https://api.bilibili.com/x/web-interface/wbi/view?"));
+        assert!(url.contains("bvid=BV1xx411c7mD"));
+        assert!(url.contains("wts=1702204169"));
+        assert!(url.contains("w_rid="));
+    }
+
+    #[test]
+    fn retries_only_first_network_failure_while_active() {
+        assert!(should_retry(RetryFailure::Network, false, false));
+        assert!(!should_retry(RetryFailure::HttpResponse, false, false));
+        assert!(!should_retry(RetryFailure::Network, true, false));
+        assert!(!should_retry(RetryFailure::Network, false, true));
+    }
+
+    #[test]
+    fn prefers_medium_aac_then_low_aac() {
+        let low = AudioStream {
+            id: 30216,
+            base_url_camel: Some("low".to_owned()),
+            base_url_snake: None,
+            backup_url_camel: vec![],
+            backup_url_snake: vec![],
+            codecs: Some("mp4a.40.2".to_owned()),
+            mime_type_camel: Some("audio/mp4".to_owned()),
+            mime_type_snake: None,
+        };
+        let medium = AudioStream {
+            id: 30232,
+            base_url_camel: Some("medium".to_owned()),
+            base_url_snake: None,
+            backup_url_camel: vec![],
+            backup_url_snake: vec![],
+            codecs: Some("mp4a.40.2".to_owned()),
+            mime_type_camel: Some("audio/mp4".to_owned()),
+            mime_type_snake: None,
+        };
+        let data = PlayurlData {
+            dash: Some(DashData {
+                audio: vec![low, medium],
+            }),
+            durl: vec![],
+        };
+
+        assert_eq!(select_audio(Some(&data)).unwrap().id, 30232);
+    }
+
+    #[test]
+    fn rejects_missing_audio_streams_clearly() {
+        let data = PlayurlData {
+            dash: Some(DashData { audio: vec![] }),
+            durl: vec![],
+        };
+
+        assert!(select_audio(Some(&data))
+            .unwrap_err()
+            .contains("data.dash.audio is empty"));
+        assert!(select_audio(None)
+            .unwrap_err()
+            .contains("no data.dash.audio"));
+    }
+
+    #[test]
+    fn falls_back_to_durl_only_for_fresh_uploads() {
+        let data = PlayurlData {
+            dash: None,
+            durl: vec![DurlStream {
+                base_url_camel: None,
+                base_url_snake: Some("https://upos.example.bilivideo.com/m.mp4".to_owned()),
+                url: None,
+                backup_url_camel: vec![
+                    "".to_owned(),
+                    "https://backup.example.bilivideo.com/b.mp4".to_owned(),
+                ],
+                backup_url_snake: vec![],
+            }],
+        };
+
+        assert!(select_audio(Some(&data)).is_err());
+        let candidates = select_muxed_durl(Some(&data)).unwrap().url_candidates();
+        assert_eq!(
+            candidates,
+            vec![
+                "https://upos.example.bilivideo.com/m.mp4",
+                "https://backup.example.bilivideo.com/b.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn durl_fallback_reports_missing_durl_clearly() {
+        let data = PlayurlData {
+            dash: Some(DashData { audio: vec![] }),
+            durl: vec![],
+        };
+
+        let error = select_muxed_durl(Some(&data)).unwrap_err();
+        assert!(error.contains("no data.durl"));
+    }
+
+    #[test]
+    fn probe_head_detects_mp4_signature() {
+        let mp4 = ProbeResult {
+            status: 206,
+            head: vec![0, 0, 0, 24, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'],
+        };
+        assert!(mp4.looks_mp4());
+
+        let flv = ProbeResult {
+            status: 206,
+            head: vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9],
+        };
+        assert!(!flv.looks_mp4());
+
+        let short = ProbeResult {
+            status: 206,
+            head: vec![0, 0, 0, 24],
+        };
+        assert!(!short.looks_mp4());
+    }
+
+    #[test]
+    fn candidates_prefer_stable_mirrors_over_mcdn() {
+        let audio = audio_stream(vec![
+            "https://xy113x207x85x153xy.mcdn.bilivideo.cn:8082/base.mp4",
+            "https://upos-sz-mirrorcos.bilivideo.com/backup1.mp4",
+            "https://cn-sccd-ct-02-11.bilivideo.com/backup2.mp4",
+            "https://xy116x196x140x19xy.mcdn.bilivideo.cn/base3.mp4",
+        ]);
+
+        assert_eq!(
+            ordered_candidates(&audio),
+            vec![
+                "https://upos-sz-mirrorcos.bilivideo.com/backup1.mp4",
+                "https://cn-sccd-ct-02-11.bilivideo.com/backup2.mp4",
+                "https://xy113x207x85x153xy.mcdn.bilivideo.cn:8082/base.mp4",
+                "https://xy116x196x140x19xy.mcdn.bilivideo.cn/base3.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn all_mcdn_candidates_still_usable_in_original_order() {
+        let audio = audio_stream(vec![
+            "https://xy1x1x1x1xy.mcdn.bilivideo.cn/a.mp4",
+            "https://xy2x2x2x2xy.mcdn.bilivideo.cn/b.mp4",
+        ]);
+
+        assert_eq!(
+            ordered_candidates(&audio),
+            vec![
+                "https://xy1x1x1x1xy.mcdn.bilivideo.cn/a.mp4",
+                "https://xy2x2x2x2xy.mcdn.bilivideo.cn/b.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_keep_each_of_three_tiers_in_original_order() {
+        let urls = vec![
+            "https://a.mcdn.bilivideo.cn/base.mp4",
+            "https://a.edge.mountaintoys.cn/backup.mp4",
+            "https://upos-a.bilivideo.com/a.mp4",
+            "https://b.mcdn.bilivideo.cn/b.mp4",
+            "https://b.mcdn.example.org/b.mp4",
+            "https://upos-b.bilivideo.com/b.mp4",
+        ];
+        let audio = audio_stream(urls.clone());
+        assert_eq!(
+            ordered_candidates(&audio),
+            vec![urls[2], urls[5], urls[0], urls[3], urls[1], urls[4]]
+        );
+    }
+
+    #[test]
+    fn candidates_keep_all_allowed_non_mcdn_in_original_order() {
+        let urls = vec![
+            "https://upos-b.bilivideo.com/b.mp4",
+            "https://upos-hz-mirrorakam.akamaized.net/a.mp4",
+            "https://upos-a.bilivideo.cn/a.mp4",
+        ];
+        assert_eq!(ordered_candidates(&audio_stream(urls.clone())), urls);
+    }
+
+    #[test]
+    fn candidates_keep_all_disallowed_in_original_order() {
+        let urls = vec![
+            "https://b.edge.mountaintoys.cn/b.mp4",
+            "https://a.mcdn.example.org/a.mp4",
+            "https://bilivideo.com.example.org/c.mp4",
+        ];
+        assert_eq!(ordered_candidates(&audio_stream(urls.clone())), urls);
+    }
+
+    #[test]
+    fn candidates_preserve_duplicate_occurrences_in_each_tier() {
+        let audio = audio_stream(vec![
+            "https://a.mcdn.bilivideo.cn/a.mp4",
+            "https://a.edge.mountaintoys.cn/a.mp4",
+            "https://upos-a.bilivideo.com/a.mp4",
+            "https://a.mcdn.bilivideo.cn/a.mp4",
+            "https://a.edge.mountaintoys.cn/a.mp4",
+            "https://upos-a.bilivideo.com/a.mp4",
+        ]);
+        let original = audio.url_candidates();
+        let expected: Vec<_> = [2, 5, 0, 3, 1, 4].map(|index| original[index]).into();
+        let ordered = ordered_candidates(&audio);
+        assert_eq!(ordered, expected);
+        // 相同内容来自不同 String；同时断言引用身份，确认重复项没有互换。
+        assert!(ordered
+            .iter()
+            .zip(&expected)
+            .all(|(actual, expected)| std::ptr::eq(*actual, *expected)));
+    }
+
+    #[test]
+    fn candidates_allow_empty_list() {
+        assert!(ordered_candidates(&audio_stream(vec![])).is_empty());
+    }
+
+    #[test]
+    fn failed_host_is_only_attempted_once() {
+        let (attempted, _) = simulate_failed_probes(&[
+            "https://upos-sz-mirrorcos.bilivideo.com/audio.m4s?deadline=1",
+            "https://upos-sz-mirrorcos.bilivideo.com/audio.m4s?deadline=2",
+        ]);
+
+        assert_eq!(attempted, vec!["upos-sz-mirrorcos.bilivideo.com"]);
+    }
+
+    #[test]
+    fn different_failed_hosts_are_each_attempted() {
+        let (attempted, _) = simulate_failed_probes(&[
+            "https://upos-sz-mirrorcos.bilivideo.com/audio.m4s",
+            "https://upos-sz-mirrorcosb.bilivideo.com/audio.m4s",
+        ]);
+
+        assert_eq!(
+            attempted,
+            vec![
+                "upos-sz-mirrorcos.bilivideo.com",
+                "upos-sz-mirrorcosb.bilivideo.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn all_failed_error_reports_skipped_host() {
+        let (_, probe_hosts) = simulate_failed_probes(&[
+            "https://upos-sz-mirrorcos.bilivideo.com/audio.m4s?deadline=1",
+            "https://upos-sz-mirrorcos.bilivideo.com/audio.m4s?deadline=2",
+        ]);
+        let error = probe_hosts.failure_detail(Some(
+            "audio URL probe request failed: connection timed out".to_owned(),
+        ));
+
+        assert!(error.contains("upos-sz-mirrorcos.bilivideo.com"));
+        assert!(!error.contains("unknown probe failure"));
+    }
+
+    #[test]
+    fn empty_probe_candidates_keep_existing_errors() {
+        let client = reqwest::Client::new();
+        let audio = audio_stream(vec![]);
+        let durl = DurlStream {
+            base_url_camel: None,
+            base_url_snake: None,
+            url: None,
+            backup_url_camel: vec![],
+            backup_url_snake: vec![],
+        };
+
+        let audio_error =
+            tauri::async_runtime::block_on(first_working_audio_url(&client, &audio)).unwrap_err();
+        let durl_error =
+            tauri::async_runtime::block_on(first_working_muxed_url(&client, &durl)).unwrap_err();
+
+        assert_eq!(
+            audio_error,
+            "selected audio id 30232 has no baseUrl/base_url or backup URLs"
+        );
+        assert_eq!(durl_error, "durl entry has no baseUrl/url");
+    }
+
+    fn simulate_failed_probes(urls: &[&str]) -> (Vec<String>, FailedProbeHosts) {
+        let mut attempted = Vec::new();
+        let mut probe_hosts = FailedProbeHosts::default();
+        for url in urls {
+            let (host, should_skip) = probe_hosts.candidate(url);
+            if should_skip {
+                continue;
+            }
+            attempted.push(host.clone());
+            probe_hosts.record_failure(host);
+        }
+        (attempted, probe_hosts)
+    }
+
+    fn audio_stream(urls: Vec<&str>) -> AudioStream {
+        let mut iter = urls.into_iter();
+        AudioStream {
+            id: 30232,
+            base_url_camel: iter.next().map(str::to_owned),
+            base_url_snake: None,
+            backup_url_camel: iter.map(str::to_owned).collect(),
+            backup_url_snake: vec![],
+            codecs: Some("mp4a.40.2".to_owned()),
+            mime_type_camel: Some("audio/mp4".to_owned()),
+            mime_type_snake: None,
+        }
+    }
+}

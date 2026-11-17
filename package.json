@@ -1,0 +1,28 @@
+{
+  "private": true,
+  "engines": {
+    "node": ">=22.18.0 <23"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check:ui-syntax": "node scripts/check-ui-syntax.ts",
+    "verify:dist": "node scripts/vite/verify-dist.ts",
+    "typecheck": "node scripts/typecheck/dom-assertion-cli.ts && node scripts/typecheck/check.ts && node scripts/vue/check.ts",
+    "test:dom": "node scripts/tests/dom.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@vitejs/plugin-vue": "6.0.10",
+    "@vue/test-utils": "2.5.1",
+    "jsdom": "26.1.0",
+    "typescript": "6.0.3",
+    "vite": "8.3.2",
+    "vue-tsc": "3.3.12"
+  },
+  "type": "module",
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "vue": "3.5.43"
+  }
+}

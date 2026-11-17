@@ -1,0 +1,117 @@
+:root {
+  --root: #17110d;
+  --bar: #1d1611;
+  --line: #2e241c;
+  --line2: #3d3126;
+  --input: #221a14;
+  --hover: #241c15;
+  --active: #2a2018;
+  --nav-active: #2d2318;
+  --text: #f0e6d8;
+  --text2: #b8a68d;
+  --text3: #8d7c66;
+  --accent-r: 212;
+  --accent-g: 162;
+  --accent-b: 83;
+  --accent: rgb(var(--accent-r), var(--accent-g), var(--accent-b));
+  --play-bg: #d4a253;
+  --play-fg: #17110d;
+  --accent-text: var(--accent);
+  --on-accent: #17110d;
+  --danger: #ff8080;
+  --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
+  --font-sans: "Noto Sans SC", -apple-system, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, monospace;
+  --track-columns: 24px 32px minmax(240px, 1fr) 160px 72px 80px 72px 68px;
+  --track-columns-compact: 24px 32px minmax(240px, 1fr) 100px 72px 0 var(--track-duration-width, 72px) 68px;
+  --track-columns-library: 24px 32px minmax(240px, 1fr) 160px 72px 0 72px 68px;
+  --fs-xl: 24px;
+  --fs-lg: 18px;
+  --fs-md: 13px;
+  --fs-sm: 12px;
+  --fs-xs: 11px;
+  --fw-xl: 700;
+  --fw-lg: 600;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-full: 50%;
+  --surface: var(--floating-surface);
+  --overlay: rgba(0, 0, 0, .45);
+  --dialog-shadow: 0 12px 32px rgba(0, 0, 0, .35);
+  --track-height: 44px;
+  --track-cover-size: 32px;
+  --player-height: 64px;
+  --player-cover-size: 40px;
+  --play-size: 36px;
+  --icon-hit-size: 32px;
+  --icon-size: 16px;
+  --icon-stroke: 1.8;
+  --progress-size: 2px;
+  --progress-hover-size: 4px;
+}
+
+:root[data-theme="light"] {
+  --overlay: rgba(0, 0, 0, .25);
+  --dialog-shadow: 0 12px 32px rgba(0, 0, 0, .12);
+  --on-accent: #fff;
+  --danger: #b42332;
+  --root: #f7f2e9;
+  --bar: #f1ebdf;
+  --line: #e2d8c8;
+  --line2: #d2c4ae;
+  --input: #fffdf8;
+  --hover: #efe7d9;
+  --active: #eae0cf;
+  --nav-active: #e5d9c4;
+  --text: #2a211a;
+  --text2: #6b5a48;
+  --text3: #8a7761;
+  --play-bg: #a87328;
+  --play-fg: #fff;
+  --accent-text: color-mix(in srgb, var(--accent) 72%, #000);
+}
+
+:root[data-theme="image"] {
+  --root: rgba(16, 11, 8, .8);
+  --bar: transparent;
+  --line: rgba(255, 255, 255, .08);
+  --line2: rgba(255, 255, 255, .16);
+  --input: rgba(0, 0, 0, .25);
+  --hover: rgba(255, 255, 255, .06);
+  --active: rgba(255, 255, 255, .09);
+  --nav-active: rgba(255, 255, 255, .09);
+  --text: #ffffff;
+  --text2: #e8dfd2;
+  --text3: #cec2b0;
+  --play-bg: #e9dcc6;
+  --play-fg: #17110d;
+}
+
+:root[data-theme="dynamic"] {
+  --root: #241a12;
+  --bar: color-mix(in srgb, var(--cover-color, rgb(40, 30, 22)) 7%, transparent);
+  --line: #2b2018;
+  --line2: #3b2d21;
+  --input: #1e1610;
+  --hover: rgba(255, 255, 255, .025);
+  --active: rgba(255, 255, 255, .035);
+  --nav-active: rgba(255, 255, 255, .045);
+  --text: #fffdf8;
+  --text2: #f2e9db;
+  --text3: #e6dccd;
+  --danger: #ffcaca;
+  --play-bg: #eeddc2;
+  --play-fg: #17110d;
+  --accent-text: color-mix(in srgb, var(--accent) 40%, #fff);
+}
+
+:root[data-theme="dynamic"] .player-bar {
+  --bar: color-mix(in srgb, var(--cover-color, rgb(40, 30, 22)) 7%, transparent);
+}

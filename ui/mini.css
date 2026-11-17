@@ -1,0 +1,838 @@
+/* 迷你播放器：卡片 + 黑胶（照 Folia 的形，配色随主题） */
+:root {
+  color-scheme: light;
+  /* 底色与文字由主窗推过来的 --mini-bg / --mini-fg 决定（跟主窗同一套配色）；
+     没推过来时才退回这层旧的白玻璃。 */
+  --mini-card: var(--mini-bg, rgba(251, 249, 245, 0.94));
+  --mini-edge: rgba(255, 255, 255, 0.62);
+  --mini-text: var(--mini-fg, #1D1A17);
+  --mini-muted: color-mix(in srgb, var(--mini-text) 46%, transparent);
+  --mini-ink: color-mix(in srgb, var(--mini-text) 62%, transparent);
+  --mini-ink-hover: color-mix(in srgb, var(--mini-text) 8%, transparent);
+  --glass-blur: 18px;
+  --accent-r: 192;
+  --accent-g: 130;
+  --accent-b: 60;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  color: var(--mini-text);
+  font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mini-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+
+/* ===== 卡片 ===== */
+.mini-panel {
+  position: absolute;
+  inset: 0;
+  border-radius: 20px;
+  overflow: hidden;
+  background: var(--mini-card);
+  backdrop-filter: blur(var(--glass-blur, 18px)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--glass-blur, 18px)) saturate(150%);
+  box-shadow:
+    0 20px 50px rgba(0, 0, 0, 0.34),
+    0 2px 8px rgba(0, 0, 0, 0.18),
+    inset 0 0 0 1px var(--mini-edge);
+}
+
+/* ===== 皮肤：右键循环切换 ===== */
+.mini-panel[data-skin="paper"] {
+  color-scheme: light;
+  --mini-card: rgba(251, 249, 245, 0.94);
+  --mini-edge: rgba(255, 255, 255, 0.62);
+  --mini-text: #1D1A17;
+  --mini-muted: rgba(29, 26, 23, 0.46);
+  --mini-ink: rgba(29, 26, 23, 0.62);
+  --mini-ink-hover: rgba(29, 26, 23, 0.08);
+}
+
+.mini-panel[data-skin="teal"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(158deg, rgba(30, 99, 94, 0.93), rgba(15, 58, 56, 0.96));
+  --mini-edge: rgba(150, 232, 219, 0.22);
+  --mini-text: #EAF7F4;
+  --mini-muted: rgba(234, 247, 244, 0.56);
+  --mini-ink: rgba(234, 247, 244, 0.74);
+  --mini-ink-hover: rgba(255, 255, 255, 0.13);
+}
+
+.mini-panel[data-skin="wood"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(156deg, rgba(74, 55, 40, 0.95), rgba(37, 27, 19, 0.97));
+  --mini-edge: rgba(196, 132, 68, 0.32);
+  --mini-text: #F6EADA;
+  --mini-muted: rgba(246, 234, 218, 0.52);
+  --mini-ink: rgba(246, 234, 218, 0.74);
+  --mini-ink-hover: rgba(255, 235, 210, 0.12);
+}
+
+.mini-panel[data-skin="ink"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(160deg, rgba(30, 30, 32, 0.94), rgba(12, 12, 14, 0.97));
+  --mini-edge: rgba(255, 255, 255, 0.16);
+  --mini-text: #F2F2F4;
+  --mini-muted: rgba(242, 242, 244, 0.48);
+  --mini-ink: rgba(242, 242, 244, 0.72);
+  --mini-ink-hover: rgba(255, 255, 255, 0.12);
+}
+
+.mini-panel[data-skin="indigo"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(158deg, rgba(49, 56, 116, 0.93), rgba(22, 26, 58, 0.96));
+  --mini-edge: rgba(160, 172, 255, 0.22);
+  --mini-text: #EEF0FF;
+  --mini-muted: rgba(238, 240, 255, 0.54);
+  --mini-ink: rgba(238, 240, 255, 0.74);
+  --mini-ink-hover: rgba(255, 255, 255, 0.13);
+}
+
+.mini-panel[data-skin="sunset"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(158deg, rgba(150, 66, 38, 0.93), rgba(68, 27, 21, 0.96));
+  --mini-edge: rgba(255, 196, 150, 0.24);
+  --mini-text: #FFF0E6;
+  --mini-muted: rgba(255, 240, 230, 0.55);
+  --mini-ink: rgba(255, 240, 230, 0.74);
+  --mini-ink-hover: rgba(255, 255, 255, 0.13);
+}
+
+/* 渐变组 */
+.mini-panel[data-skin="dawn"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(150deg, #F08A5D 0%, #D3564F 48%, #9E2F52 100%);
+  --mini-edge: rgba(255, 236, 224, 0.28);
+  --mini-text: #FFF7F1;
+  --mini-muted: rgba(255, 247, 241, 0.58);
+  --mini-ink: rgba(255, 247, 241, 0.84);
+  --mini-ink-hover: rgba(255, 255, 255, 0.16);
+}
+
+.mini-panel[data-skin="deep"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(150deg, #2E4A7D 0%, #1F6A82 55%, #14524F 100%);
+  --mini-edge: rgba(180, 226, 240, 0.24);
+  --mini-text: #EFF8FB;
+  --mini-muted: rgba(239, 248, 251, 0.56);
+  --mini-ink: rgba(239, 248, 251, 0.82);
+  --mini-ink-hover: rgba(255, 255, 255, 0.15);
+}
+
+.mini-panel[data-skin="aurora"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(150deg, #17896F 0%, #3E6E8E 52%, #5B3D8C 100%);
+  --mini-edge: rgba(190, 232, 226, 0.24);
+  --mini-text: #F0FBF8;
+  --mini-muted: rgba(240, 251, 248, 0.56);
+  --mini-ink: rgba(240, 251, 248, 0.82);
+  --mini-ink-hover: rgba(255, 255, 255, 0.15);
+}
+
+.mini-panel[data-skin="mist"] {
+  color-scheme: dark;
+  --mini-card: linear-gradient(150deg, #C98A8F 0%, #A2778C 50%, #5E6B85 100%);
+  --mini-edge: rgba(255, 240, 240, 0.24);
+  --mini-text: #FBF5F4;
+  --mini-muted: rgba(251, 245, 244, 0.58);
+  --mini-ink: rgba(251, 245, 244, 0.82);
+  --mini-ink-hover: rgba(255, 255, 255, 0.15);
+}
+
+/* ===== 白卡极简（默认皮肤）：碟收小、标题放大、留白更多 ===== */
+.mini-panel[data-skin="paper"] .mini-vinyl {
+  width: 152px;
+  height: 152px;
+  right: 22px;
+}
+
+.mini-panel[data-skin="paper"] .mini-cover,
+.mini-panel[data-skin="paper"] .mini-vinyl-mark {
+  width: 66px;
+  height: 66px;
+  margin: -33px 0 0 -33px;
+}
+
+.mini-panel[data-skin="paper"] .mini-title {
+  font-size: 27px;
+  line-height: 1.28;
+}
+
+.mini-panel[data-skin="paper"] .mini-copy {
+  width: 236px;
+}
+
+/* ===== 左侧文字 ===== */
+.mini-copy {
+  position: absolute;
+  left: 30px;
+  top: 24px;
+  width: 214px;
+  bottom: 22px;
+  display: flex;
+  flex-direction: column;
+  z-index: 3;
+}
+
+.mini-title-viewport {
+  overflow: hidden;
+  max-height: 74px;
+}
+
+.mini-title {
+  display: block;
+  font-size: 25px;
+  line-height: 1.32;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--mini-text);
+  white-space: normal;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.mini-title.is-scrolling {
+  white-space: nowrap;
+  display: block;
+  -webkit-line-clamp: unset;
+  animation: mini-title-scroll var(--mini-title-duration, 8s) ease-in-out infinite alternate;
+}
+
+@keyframes mini-title-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(var(--mini-title-distance, 0)); }
+}
+
+.mini-uploader {
+  margin-top: 9px;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--mini-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-controls {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: -6px;
+}
+
+/* ===== 控件 ===== */
+.mini-icon-button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mini-ink);
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.mini-icon-button:hover:not(:disabled) {
+  background: var(--mini-ink-hover);
+}
+
+.mini-icon-button:disabled {
+  opacity: 0.26;
+  cursor: default;
+}
+
+.mini-icon-button svg {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
+
+.mini-play-button {
+  width: 32px;
+  height: 32px;
+  color: var(--mini-text);
+}
+
+.mini-play-button svg { width: 19px; height: 19px; }
+
+.mini-icon-pause {
+  display: none;
+}
+
+.mini-panel[data-playing="true"] .mini-icon-play {
+  display: none;
+}
+
+.mini-panel[data-playing="true"] .mini-icon-pause {
+  display: block;
+}
+
+.mini-favorite.is-favorited {
+  color: rgb(var(--accent-r), var(--accent-g), var(--accent-b));
+}
+
+/* ===== 右侧黑胶 ===== */
+.mini-vinyl {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 178px;
+  height: 178px;
+  border-radius: 50%;
+  background:
+    repeating-radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.05) 0 1px, transparent 1px 3px),
+    radial-gradient(circle at 50% 50%, #201E1C 0%, #100F0E 60%, #060606 100%);
+  box-shadow:
+    0 16px 34px rgba(0, 0, 0, 0.42),
+    inset 0 0 26px rgba(0, 0, 0, 0.85),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  z-index: 2;
+}
+
+.mini-panel[data-playing="true"] .mini-vinyl {
+  animation: mini-spin 24s linear infinite;
+}
+
+@keyframes mini-spin {
+  to { transform: translateY(-50%) rotate(360deg); }
+}
+
+.mini-cover {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 78px;
+  height: 78px;
+  margin: -39px 0 0 -39px;
+  border-radius: 50%;
+  object-fit: cover;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35), 0 0 12px rgba(0, 0, 0, 0.5);
+}
+
+.mini-cover[hidden] { display: none; }
+
+.mini-vinyl-mark {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 78px;
+  height: 78px;
+  margin: -39px 0 0 -39px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: "Noto Serif SC", serif;
+  font-size: 24px;
+  color: rgba(255, 248, 240, 0.9);
+  background: radial-gradient(circle at 34% 30%, #E8895F 0%, #C4562F 52%, #7E2E1B 100%);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.32);
+}
+
+.mini-vinyl-hole {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  margin: -2.5px 0 0 -2.5px;
+  border-radius: 50%;
+  background: #0A0908;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+/* ===== 唱臂 ===== */
+.mini-arm {
+  position: absolute;
+  left: 150px;
+  bottom: 0;
+  width: 200px;
+  height: 200px;
+  z-index: 4;
+  pointer-events: none;
+  opacity: 0.72;
+  transition: transform 700ms cubic-bezier(0.22, 0.8, 0.24, 1);
+  transform-origin: 14px 186px;
+  transform: rotate(0deg);
+}
+
+.mini-panel[data-playing="true"] .mini-arm {
+  transform: rotate(-6deg);
+}
+
+.mini-arm-base {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 36% 32%, #F2EFEA, #C9C2B8 52%, #9A9288);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3), inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.mini-arm-rod {
+  position: absolute;
+  left: 14px;
+  bottom: 13px;
+  width: 174px;
+  height: 1.2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #B9B2A6, #F4F1EB);
+  transform-origin: 1px center;
+  transform: rotate(-39deg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+
+.mini-arm-head {
+  position: absolute;
+  left: 143px;
+  bottom: 118px;
+  width: 13px;
+  height: 9px;
+  border-radius: 3px;
+  background: linear-gradient(160deg, #F4F1EB, #B8B0A4);
+  transform: rotate(-39deg);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.26);
+}
+
+/* ===== 还原按钮（右上角） ===== */
+.mini-restore {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: rgba(29, 26, 23, 0.05);
+  z-index: 6;
+}
+
+.mini-restore svg { width: 14px; height: 14px; }
+
+/* ===== 提醒 ===== */
+#mini-notice {
+  position: absolute;
+  left: 30px;
+  right: 24px;
+  bottom: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(29, 26, 23, 0.06);
+  font-size: 12px;
+  color: var(--mini-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-notice-more {
+  position: absolute;
+  right: 22px;
+  bottom: 4px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(29, 26, 23, 0.08);
+  color: var(--mini-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.mini-notice-full {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  max-height: 70%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(251, 249, 245, 0.98);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.24);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--mini-text);
+  overflow: auto;
+  z-index: 8;
+}
+
+.mini-notice-more:focus-visible,
+.mini-notice-full:focus-visible,
+.mini-icon-button:focus-visible {
+  outline: 2px solid rgb(var(--accent-r), var(--accent-g), var(--accent-b));
+  outline-offset: 2px;
+}
+
+/* ===== 动态背景 ===== */
+.mini-shell { isolation: isolate; overflow: hidden; border-radius: 20px; }
+
+.dynamic-background {
+  position: absolute;
+  z-index: -2;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background: #1a1a1c;
+  border-radius: 20px;
+}
+
+.dynamic-background-layer {
+  position: absolute;
+  inset: -15%;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse at 18% 25%, var(--dynamic-color-1, rgb(48, 54, 64)), transparent 65%),
+    radial-gradient(ellipse at 82% 70%, var(--dynamic-color-2, rgb(58, 58, 62)), transparent 65%),
+    radial-gradient(ellipse at 45% 85%, var(--dynamic-color-3, rgb(58, 62, 70)), transparent 75%);
+  transition: opacity 1200ms ease;
+  animation: dynamic-background-drift 25s ease-in-out infinite;
+}
+
+.dynamic-background-layer.is-visible { opacity: 1; }
+
+.dynamic-background::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 10, 11, 0.04);
+}
+
+.dynamic-background.is-paused .dynamic-background-layer {
+  animation-play-state: paused;
+  transition: none;
+}
+
+@keyframes dynamic-background-drift {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(2%, -1.5%, 0) scale(1.06); }
+}
+
+/* ===== 缩放：八向热区 + 右下角手柄 ===== */
+.mini-zone {
+  position: absolute;
+  z-index: 9;
+  display: block;
+}
+
+.mini-zone-n,
+.mini-zone-s {
+  left: 26px;
+  right: 26px;
+  height: 6px;
+  cursor: ns-resize;
+}
+
+.mini-zone-e,
+.mini-zone-w {
+  top: 26px;
+  bottom: 26px;
+  width: 6px;
+  cursor: ew-resize;
+}
+
+.mini-zone-n { top: 0; }
+.mini-zone-s { bottom: 0; }
+.mini-zone-e { right: 0; }
+.mini-zone-w { left: 0; }
+
+.mini-zone-ne,
+.mini-zone-nw,
+.mini-zone-se,
+.mini-zone-sw {
+  width: 14px;
+  height: 14px;
+}
+
+.mini-zone-ne { top: 0; right: 0; cursor: nesw-resize; }
+.mini-zone-nw { top: 0; left: 0; cursor: nwse-resize; }
+.mini-zone-se { bottom: 0; right: 0; cursor: nwse-resize; }
+.mini-zone-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+
+.mini-grip {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 15px;
+  height: 15px;
+  z-index: 10;
+  cursor: nwse-resize;
+  opacity: 0;
+  transition: opacity 180ms ease;
+  border-radius: 3px;
+  background:
+    linear-gradient(135deg, transparent 46%, var(--mini-ink) 46%, var(--mini-ink) 54%, transparent 54%) 0 0 / 8px 8px no-repeat,
+    linear-gradient(135deg, transparent 46%, var(--mini-ink) 46%, var(--mini-ink) 54%, transparent 54%) 5px 5px / 8px 8px no-repeat;
+}
+
+.mini-shell:hover .mini-grip { opacity: 0.5; }
+.mini-grip:hover { opacity: 0.85; }
+
+.mini-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 5px;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 5px 13px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.58);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+  z-index: 20;
+}
+
+/* ============================================================
+   03 白卡极简版式（data-layout="card"）
+   版式固定，颜色全部来自 palette 变量（--pal-*）：
+     底色 --pal-bg ／ 字色 --pal-fg ／ 强调 --pal-accent ／ 主键字 --pal-on
+   大字外发光 = 强调色，是画面唯一的视觉焦点。
+   ============================================================ */
+.mini-panel[data-layout="card"] {
+  background: var(--pal-bg, #f6f0e8);
+  color: var(--pal-fg, #2b2622);
+  border-radius: 18px;
+  border: 0;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+  isolation: isolate;
+}
+
+/* 左上角一层强调色光晕：让渐变有方向感，不至于看起来是单色 */
+.mini-panel[data-layout="card"]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(130% 100% at 12% 0%, color-mix(in srgb, var(--pal-accent, #968470) 30%, transparent) 0%, transparent 58%),
+    radial-gradient(120% 110% at 92% 100%, color-mix(in srgb, var(--pal-fg, #2b2622) 16%, transparent) 0%, transparent 62%);
+}
+
+/* 播放时不要旋转：转的是整张封面，文字跟着转，看着是「歪」的 */
+.mini-panel[data-layout="card"] .mini-vinyl {
+  animation: none !important;
+}
+
+/* 左侧文字区：上贴标题、下贴控制键，右侧给封面让出 168px */
+.mini-panel[data-layout="card"] .mini-copy {
+  position: absolute;
+  z-index: 1;
+  left: 34px;
+  right: 168px;
+  top: 40px;
+  bottom: 30px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+}
+
+.mini-panel[data-layout="card"] .mini-title-viewport {
+  width: 100%;
+  overflow: hidden;
+}
+
+.mini-panel[data-layout="card"] .mini-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  max-width: 100%;
+  margin: 0;
+  font-size: 27px;
+  font-weight: 700;
+  line-height: 1.24;
+  letter-spacing: 0.5px;
+  color: var(--pal-fg, #2b2622);
+  white-space: normal;
+  text-shadow:
+    0 0 9px color-mix(in srgb, var(--pal-accent, #968470) 40%, transparent),
+    0 0 34px color-mix(in srgb, var(--pal-accent, #968470) 52%, transparent);
+}
+
+/* 滚动跑马灯时不裁成两行 */
+.mini-panel[data-layout="card"] .mini-title.is-scrolling {
+  display: block;
+  -webkit-line-clamp: unset;
+  white-space: nowrap;
+}
+
+.mini-panel[data-layout="card"] .mini-uploader {
+  margin-top: 10px;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  opacity: 0.55;
+  color: var(--pal-fg, #2b2622);
+}
+
+/* 控制键贴底：两侧弱化成 42%，只有主键实心 */
+.mini-panel[data-layout="card"] .mini-controls {
+  position: static;
+  z-index: 1;
+  margin-top: auto;
+  margin-left: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  background: none;
+}
+
+.mini-panel[data-layout="card"] .mini-icon-button {
+  width: 30px;
+  height: 30px;
+  opacity: 0.42;
+  color: var(--pal-fg, #2b2622);
+  background: none;
+  border: 0;
+}
+
+.mini-panel[data-layout="card"] .mini-icon-button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.mini-panel[data-layout="card"] .mini-play-button {
+  width: 38px;
+  height: 38px;
+  opacity: 1;
+  background: var(--pal-accent, #968470);
+  color: var(--pal-on, #fff);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--pal-accent, #968470) 45%, transparent);
+}
+
+.mini-panel[data-layout="card"] .mini-play-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* 封面 104px 黑胶圆盘，靠右居中。中间贴当前专辑封面（用户要的），
+   但整盘不旋转——一转型封面上的字和构图就歪了。 */
+.mini-panel[data-layout="card"] .mini-vinyl {
+  width: 104px;
+  height: 104px;
+  right: 38px;
+  top: 50%;
+  bottom: auto;
+  margin: 0;
+  transform: translateY(-50%);
+  border-radius: 50%;
+  background:
+    repeating-radial-gradient(circle at 50% 50%,
+      rgba(255, 255, 255, 0.055) 0 1px,
+      transparent 1px 3px),
+    radial-gradient(circle at 50% 50%, #24211e 0%, #141210 62%, #070707 100%);
+  box-shadow:
+    0 10px 26px rgba(0, 0, 0, 0.34),
+    inset 0 0 24px rgba(0, 0, 0, 0.78),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+  animation: none !important;
+}
+
+.mini-panel[data-layout="card"] .mini-cover {
+  display: block;
+  left: 50%;
+  top: 50%;
+  width: 66px;
+  height: 66px;
+  margin: -33px 0 0 -33px;
+  border-radius: 50%;
+  object-fit: cover;
+  object-position: center;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.mini-panel[data-layout="card"] .mini-vinyl-mark,
+.mini-panel[data-layout="card"] .mini-vinyl-hole,
+.mini-panel[data-layout="card"] .mini-arm,
+.mini-panel[data-layout="card"] .mini-favorite {
+  display: none;
+}
+
+/* 还原按钮：平时隐到几乎看不见，悬停才出来 */
+.mini-panel[data-layout="card"] .mini-restore {
+  right: 12px;
+  bottom: 10px;
+  opacity: 0;
+  color: var(--pal-fg, #2b2622);
+  transition: opacity 160ms ease;
+}
+
+.mini-shell:hover .mini-panel[data-layout="card"] .mini-restore {
+  opacity: 0.42;
+}
+
+.mini-panel[data-layout="card"] .mini-restore:hover {
+  opacity: 0.9;
+}
+
+/* 底部进度线：2.5px，颜色跟强调色 */
+.mini-panel[data-layout="card"] .mini-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2.5px;
+  background: color-mix(in srgb, var(--pal-fg, #2b2622) 10%, transparent);
+  overflow: hidden;
+}
+
+.mini-panel[data-layout="card"] .mini-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--pal-accent, #968470);
+  transition: width 240ms linear;
+}
+
+/* ===== 图片背景主题：小组件也铺同一张图，卡片退成玻璃 ===== */
+html[data-theme="image"] .mini-shell {
+  background: var(--mini-background) center / cover no-repeat;
+}
+
+html[data-theme="image"] .mini-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 20px;
+  --mini-mask: min(calc(var(--background-dim, .9) * 1.375), calc(.55 + (var(--background-dim, .9) - .4) * .4 / .55));
+  background: rgba(8, 9, 12, var(--mini-mask));
+  pointer-events: none;
+}
+
+html[data-theme="image"] .mini-panel[data-layout="card"] {
+  background: linear-gradient(180deg, rgba(16, 15, 19, .12), rgba(16, 15, 19, .42));
+  backdrop-filter: blur(var(--glass-blur, 18px)) saturate(120%);
+  -webkit-backdrop-filter: blur(var(--glass-blur, 18px)) saturate(120%);
+}
