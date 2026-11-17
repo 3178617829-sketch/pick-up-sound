@@ -104,8 +104,8 @@ bili-music v1.0.0 的本地改造副本，成品叫 **Pick Up Sound**（Windows 
 - 维护者本地另有一套构建与部署脚本，用来产出交付的 exe，不在本仓库内；下文提到的绝对路径都是维护者本机的，不属于仓库内容。
 - 改完只需要产出 exe 交给用户，由用户手测。
 - **两份成品必须字节一致**（备份那份故意不一致，它放验收过的稳定版，见下）：
-  `D:\NDSH\BFM电台\Pick Up Sound.exe`、`C:\Users\Lenovo\Desktop\BFM电台\Pick Up Sound.exe`
-  第三份 `D:\BFM电台备份\Pick Up Sound.exe` 是**「出事能退回」的稳定版，永不自动覆盖**；要升级它必须显式跑 `deploy.bat -PromoteStable`。三份一律同步就等于一坏全坏（2026-11-01 下午已经这么翻车过一次）。
+  项目目录下的 `Pick Up Sound.exe` 与桌面 `BFM电台\Pick Up Sound.exe`
+  第三份（备份盘的稳定版）**永不自动覆盖**；要升级它必须显式跑 `deploy.bat -PromoteStable`。三份一律同步就等于一坏全坏（2026-11-01 下午已经这么翻车过一次）。
 
 ## 三条命令（都在 `D:\NDSH\.probe\`）
 
